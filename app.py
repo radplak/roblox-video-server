@@ -3,11 +3,11 @@ import struct
 import tempfile
 import threading
 import subprocess
-import time
 import traceback
 
 import requests
 import imageio_ffmpeg
+import numpy as np
 
 from flask import Flask, request, jsonify, Response
 
@@ -18,7 +18,10 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 FPS = 30
 
-# Maximum EditableImage-friendly target.
+BLOCK_SIZE = 8
+
+KEYFRAME_INTERVAL = 30
+
 QUALITIES = [
     (1024, 576),
     (854, 480),
@@ -27,15 +30,9 @@ QUALITIES = [
     (320, 180),
 ]
 
-# RBC1 settings.
-BLOCK_SIZE = 8
-
-# Full keyframe every N frames.
-KEYFRAME_INTERVAL = 30
 
 VIDEO_CACHE = {}
-
-DECODERS = {}
+STREAMS = {}
 
 LOCK = threading.Lock()
 
@@ -55,7 +52,7 @@ def get_archive_video(archive_url):
     )
 
     if not identifier:
-        raise Exception("Missing Internet Archive identifier")
+        raise Exception("Invalid Internet Archive identifier")
 
     response = requests.get(
         f"https://archive.org/metadata/{identifier}",
@@ -95,16 +92,14 @@ def get_archive_video(archive_url):
 
     selected = videos[0]
 
-    direct_url = (
-        "https://archive.org/download/"
-        + identifier
-        + "/"
-        + selected["name"]
-    )
-
     return {
         "identifier": identifier,
-        "url": direct_url,
+        "url": (
+            "https://archive.org/download/"
+            + identifier
+            + "/"
+            + selected["name"]
+        ),
         "filename": selected["name"],
         "size": selected["size"]
     }
@@ -126,22 +121,32 @@ def download_video(url, identifier):
         exist_ok=True
     )
 
+    safe_identifier = identifier.replace(
+        "/",
+        "_"
+    )
+
     filename = os.path.join(
         cache_dir,
-        identifier.replace("/", "_") + ".mp4"
+        safe_identifier + ".mp4"
     )
 
     if os.path.exists(filename):
 
         try:
+
             if os.path.getsize(filename) > 0:
                 return filename
+
         except Exception:
             pass
 
     temporary = filename + ".download"
 
-    print("[Video] Downloading:", url)
+    print(
+        "[Video] Downloading:",
+        url
+    )
 
     with requests.get(
         url,
@@ -186,15 +191,15 @@ def get_video(archive_url):
 
     with LOCK:
 
-        if identifier in VIDEO_CACHE:
+        path = VIDEO_CACHE.get(
+            identifier
+        )
 
-            path = VIDEO_CACHE[identifier]
+        if path and os.path.exists(path):
 
-            if os.path.exists(path):
+            info["path"] = path
 
-                info["path"] = path
-
-                return info
+            return info
 
     path = download_video(
         info["url"],
@@ -202,7 +207,10 @@ def get_video(archive_url):
     )
 
     with LOCK:
-        VIDEO_CACHE[identifier] = path
+
+        VIDEO_CACHE[
+            identifier
+        ] = path
 
     info["path"] = path
 
@@ -210,41 +218,7 @@ def get_video(archive_url):
 
 
 # ============================================================
-# RGB888 -> RGB565
-# ============================================================
-
-def rgb565(r, g, b):
-
-    return (
-        ((r >> 3) << 11)
-        |
-        ((g >> 2) << 5)
-        |
-        (b >> 3)
-    )
-
-
-# ============================================================
-# RGB565 -> RGBA
-#
-# Used only for understanding / testing.
-# ============================================================
-
-def rgb565_to_rgba(value):
-
-    r = (value >> 11) & 31
-    g = (value >> 5) & 63
-    b = value & 31
-
-    r = (r << 3) | (r >> 2)
-    g = (g << 2) | (g >> 4)
-    b = (b << 3) | (b >> 2)
-
-    return r, g, b, 255
-
-
-# ============================================================
-# FFmpeg decoder
+# FFmpeg
 # ============================================================
 
 class FFmpegDecoder:
@@ -268,9 +242,9 @@ class FFmpegDecoder:
             * 3
         )
 
-        self.process = None
-
         self.lock = threading.Lock()
+
+        self.process = None
 
         self.start()
 
@@ -293,7 +267,7 @@ class FFmpegDecoder:
             "-vf",
             (
                 f"scale={self.width}:{self.height}:"
-                "flags=bicubic"
+                "flags=bilinear"
             ),
 
             "-r",
@@ -306,91 +280,85 @@ class FFmpegDecoder:
             "rawvideo",
 
             "pipe:1"
-        ]
 
-        print(
-            "[Codec] Starting FFmpeg:",
-            self.width,
-            "x",
-            self.height
-        )
+        ]
 
         self.process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=0
+            bufsize=1024 * 1024
         )
 
-    def read_exact(self, size):
+    def read_exact(self, amount):
 
-        data = bytearray()
+        result = bytearray()
 
-        while len(data) < size:
+        while len(result) < amount:
 
             chunk = self.process.stdout.read(
-                min(
-                    1024 * 1024,
-                    size - len(data)
-                )
+                amount - len(result)
             )
 
             if not chunk:
                 return None
 
-            data.extend(chunk)
+            result.extend(
+                chunk
+            )
 
-        return bytes(data)
+        return bytes(result)
 
     def get_frame(self):
 
         with self.lock:
 
-            if self.process is None:
-                return None
-
             frame = self.read_exact(
                 self.frame_size
             )
 
-            if frame is not None:
-                return frame
+            if frame is None:
 
-            try:
+                return None
 
-                error = (
-                    self.process.stderr.read()
-                    .decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-                )
+            return np.frombuffer(
+                frame,
+                dtype=np.uint8
+            ).reshape(
+                self.height,
+                self.width,
+                3
+            )
 
-                if error.strip():
-                    print(
-                        "[Codec] FFmpeg:",
-                        error
-                    )
+    def restart(self):
 
-            except Exception:
-                pass
+        try:
 
-            return None
+            if self.process:
+                self.process.kill()
+
+        except Exception:
+            pass
+
+        self.process = None
+
+        self.start()
 
     def stop(self):
 
-        if self.process:
+        try:
 
-            try:
+            if self.process:
                 self.process.kill()
-            except Exception:
-                pass
 
-            self.process = None
+        except Exception:
+            pass
+
+        self.process = None
 
 
 # ============================================================
-# RBC1 ENCODER
+# RBC1 CODEC
 # ============================================================
 
 class RBC1Encoder:
@@ -409,41 +377,39 @@ class RBC1Encoder:
 
         self.previous = None
 
-        self.decoder_frame = None
-
     # --------------------------------------------------------
-    # Read RGB pixel
+    # RGB888 -> RGB565
     # --------------------------------------------------------
 
-    def get_pixel(
+    def rgb565(
         self,
-        frame,
-        x,
-        y
+        frame
     ):
 
-        index = (
-            (y * self.width + x)
-            * 3
+        r = frame[:, :, 0].astype(
+            np.uint16
         )
 
-        return (
-            frame[index],
-            frame[index + 1],
-            frame[index + 2]
+        g = frame[:, :, 1].astype(
+            np.uint16
         )
+
+        b = frame[:, :, 2].astype(
+            np.uint16
+        )
+
+        value = (
+            ((r >> 3) << 11)
+            |
+            ((g >> 2) << 5)
+            |
+            (b >> 3)
+        )
+
+        return value
 
     # --------------------------------------------------------
-    # Encode a complete frame
-    #
-    # Format:
-    #
-    # RBC1
-    # frame type
-    # width
-    # height
-    # frame number
-    # RGB565 pixels
+    # KEYFRAME
     # --------------------------------------------------------
 
     def encode_keyframe(
@@ -451,76 +417,27 @@ class RBC1Encoder:
         frame
     ):
 
-        output = bytearray()
-
-        output.extend(
-            b"RBC1"
+        pixels = self.rgb565(
+            frame
         )
 
-        output.append(
-            0
-        )
+        payload = pixels.astype(
+            "<u2"
+        ).tobytes()
 
-        output.extend(
-            struct.pack(
-                "<HHI",
-                self.width,
-                self.height,
-                self.frame_number
-            )
-        )
-
-        pixel_count = (
-            self.width
-            * self.height
-        )
-
-        pixels = bytearray(
-            pixel_count * 2
-        )
-
-        out_index = 0
-
-        for i in range(
+        header = struct.pack(
+            "<4sBHHI",
+            b"RBC1",
             0,
-            len(frame),
-            3
-        ):
-
-            value = rgb565(
-                frame[i],
-                frame[i + 1],
-                frame[i + 2]
-            )
-
-            pixels[
-                out_index
-            ] = value & 255
-
-            pixels[
-                out_index + 1
-            ] = (value >> 8) & 255
-
-            out_index += 2
-
-        output.extend(
-            pixels
+            self.width,
+            self.height,
+            self.frame_number
         )
 
-        return bytes(output)
+        return header + payload
 
     # --------------------------------------------------------
-    # Encode delta frame
-    #
-    # Image divided into 8x8 blocks.
-    #
-    # Block:
-    #
-    # 0 = unchanged
-    #
-    # 1 = changed + raw RGB565
-    #
-    # This is intentionally simple for RBC1.
+    # DELTA
     # --------------------------------------------------------
 
     def encode_delta(
@@ -528,24 +445,7 @@ class RBC1Encoder:
         frame
     ):
 
-        output = bytearray()
-
-        output.extend(
-            b"RBC1"
-        )
-
-        output.append(
-            1
-        )
-
-        output.extend(
-            struct.pack(
-                "<HHI",
-                self.width,
-                self.height,
-                self.frame_number
-            )
-        )
+        previous = self.previous
 
         blocks_x = (
             self.width
@@ -559,65 +459,65 @@ class RBC1Encoder:
             - 1
         ) // BLOCK_SIZE
 
+        current565 = self.rgb565(
+            frame
+        )
+
+        previous565 = self.rgb565(
+            previous
+        )
+
+        output = bytearray()
+
         output.extend(
             struct.pack(
-                "<HH",
+                "<4sBHHIHH",
+                b"RBC1",
+                1,
+                self.width,
+                self.height,
+                self.frame_number,
                 blocks_x,
                 blocks_y
             )
         )
 
-        previous = self.previous
-
         for by in range(
             blocks_y
         ):
+
+            y0 = by * BLOCK_SIZE
+
+            y1 = min(
+                y0 + BLOCK_SIZE,
+                self.height
+            )
 
             for bx in range(
                 blocks_x
             ):
 
                 x0 = bx * BLOCK_SIZE
-                y0 = by * BLOCK_SIZE
 
                 x1 = min(
                     x0 + BLOCK_SIZE,
                     self.width
                 )
 
-                y1 = min(
-                    y0 + BLOCK_SIZE,
-                    self.height
-                )
+                current_block = current565[
+                    y0:y1,
+                    x0:x1
+                ]
 
-                changed = False
+                previous_block = previous565[
+                    y0:y1,
+                    x0:x1
+                ]
 
-                # Check block difference.
-                for y in range(
-                    y0,
-                    y1
+                if np.array_equal(
+                    current_block,
+                    previous_block
                 ):
-
-                    start = (
-                        (y * self.width + x0)
-                        * 3
-                    )
-
-                    end = (
-                        (y * self.width + x1)
-                        * 3
-                    )
-
-                    if (
-                        frame[start:end]
-                        !=
-                        previous[start:end]
-                    ):
-
-                        changed = True
-                        break
-
-                if not changed:
 
                     output.append(
                         0
@@ -629,7 +529,6 @@ class RBC1Encoder:
                     1
                 )
 
-                # Write dimensions.
                 output.append(
                     x1 - x0
                 )
@@ -638,40 +537,18 @@ class RBC1Encoder:
                     y1 - y0
                 )
 
-                # Write pixels.
-                for y in range(
-                    y0,
-                    y1
-                ):
+                output.extend(
+                    current_block.astype(
+                        "<u2"
+                    ).tobytes()
+                )
 
-                    for x in range(
-                        x0,
-                        x1
-                    ):
-
-                        r, g, b = self.get_pixel(
-                            frame,
-                            x,
-                            y
-                        )
-
-                        value = rgb565(
-                            r,
-                            g,
-                            b
-                        )
-
-                        output.extend(
-                            struct.pack(
-                                "<H",
-                                value
-                            )
-                        )
-
-        return bytes(output)
+        return bytes(
+            output
+        )
 
     # --------------------------------------------------------
-    # Encode
+    # ENCODE
     # --------------------------------------------------------
 
     def encode(
@@ -679,54 +556,52 @@ class RBC1Encoder:
         frame
     ):
 
-        force_keyframe = (
+        if (
             self.previous is None
             or
             self.frame_number
             % KEYFRAME_INTERVAL
             == 0
-        )
+        ):
 
-        if force_keyframe:
-
-            packet = self.encode_keyframe(
+            result = self.encode_keyframe(
                 frame
             )
 
         else:
 
-            packet = self.encode_delta(
+            result = self.encode_delta(
                 frame
             )
 
-        self.previous = frame
+        self.previous = frame.copy()
 
         self.frame_number += 1
 
-        return packet
+        return result
 
 
 # ============================================================
-# DECODER STATE
+# STREAM
 # ============================================================
 
-class StreamState:
+class VideoStream:
 
     def __init__(
         self,
-        video_path,
+        path,
         width,
         height
     ):
 
-        self.video_path = video_path
+        self.path = path
 
         self.width = width
 
         self.height = height
 
-        self.ffmpeg = FFmpegDecoder(
-            video_path,
+        self.decoder = FFmpegDecoder(
+            path,
             width,
             height
         )
@@ -738,29 +613,30 @@ class StreamState:
 
         self.lock = threading.Lock()
 
-    def next_packet(self):
+    def next_frame(self):
 
         with self.lock:
 
-            frame = self.ffmpeg.get_frame()
+            frame = self.decoder.get_frame()
 
             if frame is None:
 
-                # Restart decoder.
-                self.ffmpeg.stop()
-
-                self.ffmpeg = FFmpegDecoder(
-                    self.video_path,
-                    self.width,
-                    self.height
+                print(
+                    "[Codec] FFmpeg reached EOF. Restarting."
                 )
 
-                frame = self.ffmpeg.get_frame()
+                self.decoder.restart()
+
+                self.encoder.previous = None
+
+                self.encoder.frame_number = 0
+
+                frame = self.decoder.get_frame()
 
                 if frame is None:
 
                     raise Exception(
-                        "FFmpeg could not produce a frame"
+                        "Could not decode video frame"
                     )
 
             return self.encoder.encode(
@@ -769,11 +645,11 @@ class StreamState:
 
     def stop(self):
 
-        self.ffmpeg.stop()
+        self.decoder.stop()
 
 
 # ============================================================
-# STREAM STATE
+# GET STREAM
 # ============================================================
 
 def get_stream(
@@ -791,38 +667,39 @@ def get_stream(
 
     with LOCK:
 
-        stream = DECODERS.get(
+        stream = STREAMS.get(
             key
         )
 
         if stream:
             return stream
 
-        # Stop other resolutions for this video.
-        old_keys = [
-            k for k in DECODERS
-            if k[0] == identifier
-            and k != key
-        ]
+        # Remove old resolutions.
+        for old_key in list(
+            STREAMS.keys()
+        ):
 
-        for old_key in old_keys:
+            if (
+                old_key[0]
+                == identifier
+            ):
 
-            old_stream = DECODERS.pop(
-                old_key
-            )
+                old_stream = STREAMS.pop(
+                    old_key
+                )
 
-            try:
-                old_stream.stop()
-            except Exception:
-                pass
+                try:
+                    old_stream.stop()
+                except Exception:
+                    pass
 
-        stream = StreamState(
+        stream = VideoStream(
             path,
             width,
             height
         )
 
-        DECODERS[
+        STREAMS[
             key
         ] = stream
 
@@ -830,44 +707,7 @@ def get_stream(
 
 
 # ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-def home():
-
-    return jsonify({
-
-        "success": True,
-
-        "server":
-            "RBC1",
-
-        "fps":
-            FPS,
-
-        "blockSize":
-            BLOCK_SIZE,
-
-        "keyframeInterval":
-            KEYFRAME_INTERVAL,
-
-        "qualities": [
-
-            {
-                "width": w,
-                "height": h
-            }
-
-            for w, h
-            in QUALITIES
-        ]
-
-    })
-
-
-# ============================================================
-# VIDEO
+# VIDEO INFO
 # ============================================================
 
 @app.route("/video")
@@ -898,7 +738,7 @@ def video():
             url
         )
 
-        width, height = QUALITIES[0]
+        width, height = QUALITIES[1]
 
         return jsonify({
 
@@ -929,14 +769,11 @@ def video():
                 "RBC1",
 
             "qualities": [
-
                 {
                     "width": w,
                     "height": h
                 }
-
-                for w, h
-                in QUALITIES
+                for w, h in QUALITIES
             ]
 
         })
@@ -946,17 +783,13 @@ def video():
         traceback.print_exc()
 
         return jsonify({
-
             "success": False,
-
-            "error":
-                str(e)
-
+            "error": str(e)
         }), 500
 
 
 # ============================================================
-# RBC1 FRAME
+# ONE FRAME
 # ============================================================
 
 @app.route("/frame")
@@ -966,35 +799,19 @@ def frame():
         "url"
     )
 
-    if not url:
-
-        return jsonify({
-            "success": False,
-            "error": "Missing url"
-        }), 400
-
-    try:
-
-        width = int(
-            request.args.get(
-                "width",
-                "1024"
-            )
+    width = int(
+        request.args.get(
+            "width",
+            "854"
         )
+    )
 
-        height = int(
-            request.args.get(
-                "height",
-                "576"
-            )
+    height = int(
+        request.args.get(
+            "height",
+            "480"
         )
-
-    except ValueError:
-
-        return jsonify({
-            "success": False,
-            "error": "Invalid resolution"
-        }), 400
+    )
 
     if (
         width,
@@ -1019,64 +836,167 @@ def frame():
             height
         )
 
-        packet = stream.next_packet()
-
-        print(
-            "[RBC1]",
-            width,
-            "x",
-            height,
-            "frame:",
-            stream.encoder.frame_number - 1,
-            "packet:",
-            len(packet),
-            "bytes"
-        )
+        packet = stream.next_frame()
 
         return Response(
-
             packet,
-
             mimetype=
-                "application/octet-stream",
-
-            headers={
-
-                "Cache-Control":
-                    "no-cache",
-
-                "X-RBC1":
-                    "1",
-
-                "X-Width":
-                    str(width),
-
-                "X-Height":
-                    str(height),
-
-                "X-FPS":
-                    str(FPS)
-
-            }
-
+                "application/octet-stream"
         )
 
     except Exception as e:
 
         print(
-            "[RBC1] ERROR:",
+            "[RBC1] Frame error:",
             repr(e)
         )
 
         traceback.print_exc()
 
         return jsonify({
-
             "success": False,
+            "error": str(e)
+        }), 500
 
-            "error":
-                str(e)
 
+# ============================================================
+# MULTI-FRAME
+# ============================================================
+
+@app.route("/frames")
+def frames():
+
+    url = request.args.get(
+        "url"
+    )
+
+    width = int(
+        request.args.get(
+            "width",
+            "854"
+        )
+    )
+
+    height = int(
+        request.args.get(
+            "height",
+            "480"
+        )
+    )
+
+    count = int(
+        request.args.get(
+            "count",
+            "8"
+        )
+    )
+
+    count = max(
+        1,
+        min(
+            count,
+            12
+        )
+    )
+
+    if (
+        width,
+        height
+    ) not in QUALITIES:
+
+        return jsonify({
+            "success": False,
+            "error": "Unsupported resolution"
+        }), 400
+
+    try:
+
+        info = get_video(
+            url
+        )
+
+        stream = get_stream(
+            info["identifier"],
+            info["path"],
+            width,
+            height
+        )
+
+        output = bytearray()
+
+        packets = []
+
+        start = time.time()
+
+        for _ in range(count):
+
+            packet = stream.next_frame()
+
+            packets.append(
+                packet
+            )
+
+        # ----------------------------------------------------
+        # Batch format:
+        #
+        # uint32 packet count
+        #
+        # repeated:
+        # uint32 packet length
+        # packet data
+        # ----------------------------------------------------
+
+        output.extend(
+            struct.pack(
+                "<I",
+                len(packets)
+            )
+        )
+
+        for packet in packets:
+
+            output.extend(
+                struct.pack(
+                    "<I",
+                    len(packet)
+                )
+            )
+
+            output.extend(
+                packet
+            )
+
+        elapsed =
+            time.time() - start
+
+        print(
+            "[RBC1] Batch:",
+            len(packets),
+            "frames",
+            "bytes:",
+            len(output),
+            "time:",
+            round(elapsed, 3)
+        )
+
+        return Response(
+            bytes(output),
+            mimetype=
+                "application/octet-stream"
+        )
+
+    except Exception as e:
+
+        print(
+            "[RBC1] Batch error:",
+            repr(e)
+        )
+
+        traceback.print_exc()
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
         }), 500
 
 
@@ -1094,8 +1014,11 @@ def health():
         "codec":
             "RBC1",
 
+        "fps":
+            FPS,
+
         "streams":
-            len(DECODERS),
+            len(STREAMS),
 
         "videos":
             len(VIDEO_CACHE)
@@ -1117,20 +1040,15 @@ if __name__ == "__main__":
     )
 
     print(
-        "========================================"
+        "================================"
     )
 
     print(
-        "RBC1 Roblox Video Server"
+        "RBC1 VIDEO SERVER"
     )
 
     print(
-        "========================================"
-    )
-
-    print(
-        "Port:",
-        port
+        "================================"
     )
 
     print(
@@ -1144,17 +1062,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "Block size:",
-        BLOCK_SIZE
-    )
-
-    print(
-        "Keyframe interval:",
-        KEYFRAME_INTERVAL
-    )
-
-    print(
-        "========================================"
+        "================================"
     )
 
     app.run(
