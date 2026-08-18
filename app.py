@@ -1,9 +1,8 @@
 import os
 import base64
 import tempfile
-import threading
 import subprocess
-import time
+import threading
 from collections import OrderedDict
 
 import requests
@@ -19,42 +18,48 @@ app = Flask(__name__)
 # CONFIG
 # ============================================================
 
-WIDTH = 854
-HEIGHT = 480
-FPS = 30
+TARGET_FPS = 30
 
-# How many frames FFmpeg produces in one decode request.
-BATCH_SIZE = 30
+# Maximum resolution.
+# The source will NOT be enlarged.
+MAX_WIDTH = 1280
+MAX_HEIGHT = 720
 
-# Maximum cached decoded frames per video.
-MAX_FRAME_CACHE = 180
+# Frames returned by one request.
+MAX_BATCH = 6
+
+# Maximum frames kept in memory for a video.
+MAX_CACHE_FRAMES = 180
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 # ============================================================
-# CACHE
+# GLOBAL CACHE
 # ============================================================
 
 VIDEO_INFO_CACHE = {}
 VIDEO_FILE_CACHE = {}
-
+DECODERS = {}
 FRAME_CACHE = {}
 
 CACHE_LOCK = threading.RLock()
 
 
 # ============================================================
-# HELPERS
+# GET INTERNET ARCHIVE IDENTIFIER
 # ============================================================
 
-def get_identifier(archive_url):
+def get_identifier(url):
 
-    if "/details/" not in archive_url:
-        raise ValueError("Invalid Internet Archive URL")
+    if "/details/" not in url:
+
+        raise ValueError(
+            "Invalid Internet Archive URL"
+        )
 
     identifier = (
-        archive_url
+        url
         .split("/details/", 1)[1]
         .split("?", 1)[0]
         .split("#", 1)[0]
@@ -62,34 +67,46 @@ def get_identifier(archive_url):
     )
 
     if not identifier:
-        raise ValueError("Missing Internet Archive identifier")
+
+        raise ValueError(
+            "Missing Internet Archive identifier"
+        )
 
     return identifier
 
 
 # ============================================================
-# INTERNET ARCHIVE
+# INTERNET ARCHIVE METADATA
 # ============================================================
 
 def get_archive_video(archive_url):
 
-    identifier = get_identifier(archive_url)
+    identifier = get_identifier(
+        archive_url
+    )
 
     with CACHE_LOCK:
 
-        cached = VIDEO_INFO_CACHE.get(identifier)
+        cached = VIDEO_INFO_CACHE.get(
+            identifier
+        )
 
         if cached:
+
             return cached
 
+
     metadata_url = (
-        f"https://archive.org/metadata/{identifier}"
+        "https://archive.org/metadata/"
+        + identifier
     )
 
+
     print(
-        "[Archive] Metadata:",
-        metadata_url
+        "[Archive] Requesting metadata:",
+        identifier
     )
+
 
     response = requests.get(
         metadata_url,
@@ -98,107 +115,161 @@ def get_archive_video(archive_url):
 
     response.raise_for_status()
 
-    data = response.json()
+    metadata = response.json()
+
 
     videos = []
 
-    for file_data in data.get("files", []):
 
-        name = file_data.get("name", "")
+    for file_data in metadata.get(
+        "files",
+        []
+    ):
 
-        if not name.lower().endswith(".mp4"):
+        name = file_data.get(
+            "name",
+            ""
+        )
+
+
+        if not name.lower().endswith(
+            ".mp4"
+        ):
+
             continue
 
+
         try:
+
             size = int(
-                file_data.get("size", 0)
+                file_data.get(
+                    "size",
+                    0
+                )
             )
+
         except Exception:
+
             size = 0
 
+
         videos.append({
+
             "name": name,
+
             "size": size
+
         })
 
+
     if not videos:
+
         raise Exception(
             "No MP4 file found on Internet Archive"
         )
 
-    # Prefer the largest MP4.
+
+    # Prefer largest MP4.
     videos.sort(
-        key=lambda x: x["size"],
+        key=lambda item: item["size"],
         reverse=True
     )
 
+
     selected = videos[0]
+
 
     direct_url = (
         "https://archive.org/download/"
-        f"{identifier}/"
-        f"{selected['name']}"
+        + identifier
+        + "/"
+        + selected["name"]
     )
 
+
     result = {
-        "identifier": identifier,
-        "url": direct_url,
-        "filename": selected["name"],
-        "size": selected["size"]
+
+        "identifier":
+            identifier,
+
+        "filename":
+            selected["name"],
+
+        "size":
+            selected["size"],
+
+        "url":
+            direct_url
+
     }
+
 
     with CACHE_LOCK:
 
-        VIDEO_INFO_CACHE[identifier] = result
+        VIDEO_INFO_CACHE[
+            identifier
+        ] = result
+
 
     return result
 
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD VIDEO
 # ============================================================
 
-def download_video(url, identifier):
+def download_video(
+    url,
+    identifier
+):
 
-    cache_dir = os.path.join(
+    directory = os.path.join(
         tempfile.gettempdir(),
-        "roblox_videos"
+        "roblox_video_cache"
     )
 
+
     os.makedirs(
-        cache_dir,
+        directory,
         exist_ok=True
     )
 
-    safe_identifier = (
+
+    safe_name = (
         identifier
         .replace("/", "_")
         .replace("\\", "_")
         .replace(":", "_")
     )
 
-    filename = os.path.join(
-        cache_dir,
-        safe_identifier + ".mp4"
+
+    path = os.path.join(
+        directory,
+        safe_name + ".mp4"
     )
 
-    if os.path.exists(filename):
 
-        if os.path.getsize(filename) > 0:
+    if os.path.exists(path):
+
+        if os.path.getsize(path) > 0:
 
             print(
-                "[Video] Using cached:",
-                filename
+                "[Video] Using cached video:",
+                path
             )
 
-            return filename
+            return path
 
-    temporary = filename + ".download"
+
+    temporary_path =
+        path + ".download"
+
 
     print(
         "[Video] Downloading:",
         url
     )
+
 
     with requests.get(
         url,
@@ -208,42 +279,55 @@ def download_video(url, identifier):
 
         response.raise_for_status()
 
+
         with open(
-            temporary,
+            temporary_path,
             "wb"
-        ) as file:
+        ) as output:
 
             for chunk in response.iter_content(
                 chunk_size=1024 * 1024
             ):
 
                 if chunk:
-                    file.write(chunk)
+
+                    output.write(
+                        chunk
+                    )
+
 
     os.replace(
-        temporary,
-        filename
+        temporary_path,
+        path
     )
+
 
     print(
         "[Video] Download complete:",
-        filename
+        path
     )
 
-    return filename
+
+    return path
 
 
 # ============================================================
 # GET LOCAL VIDEO
 # ============================================================
 
-def get_video(archive_url):
+def get_video(
+    archive_url
+):
 
     info = get_archive_video(
         archive_url
     )
 
-    identifier = info["identifier"]
+
+    identifier = info[
+        "identifier"
+    ]
+
 
     with CACHE_LOCK:
 
@@ -251,7 +335,10 @@ def get_video(archive_url):
             identifier
         )
 
-        if cached and os.path.exists(cached):
+
+        if cached and os.path.exists(
+            cached
+        ):
 
             result = dict(info)
 
@@ -259,14 +346,22 @@ def get_video(archive_url):
 
             return result
 
+
     path = download_video(
+
         info["url"],
+
         identifier
+
     )
+
 
     with CACHE_LOCK:
 
-        VIDEO_FILE_CACHE[identifier] = path
+        VIDEO_FILE_CACHE[
+            identifier
+        ] = path
+
 
     result = dict(info)
 
@@ -276,62 +371,255 @@ def get_video(archive_url):
 
 
 # ============================================================
-# VIDEO PROBE
+# PROBE SOURCE VIDEO
 # ============================================================
 
-def probe_video(video_path):
+def probe_video(
+    video_path
+):
 
     command = [
-        FFMPEG_PATH,
 
-        "-hide_banner",
-        "-loglevel",
+        "ffprobe",
+
+        "-v",
         "error",
 
-        "-i",
-        video_path,
+        "-select_streams",
+        "v:0",
 
-        "-f",
-        "null",
+        "-show_entries",
+        "stream=width,height,r_frame_rate",
 
-        "-"
+        "-of",
+        "default=noprint_wrappers=1",
+
+        video_path
     ]
 
-    # We don't actually need the output here.
-    # This simply verifies FFmpeg can open the file.
 
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30
-    )
+    try:
+
+        result = subprocess.run(
+
+            command,
+
+            stdout=subprocess.PIPE,
+
+            stderr=subprocess.PIPE,
+
+            text=True,
+
+            timeout=30
+
+        )
+
+
+    except FileNotFoundError:
+
+        # imageio-ffmpeg provides ffmpeg.
+        # If ffprobe isn't available, use FFmpeg fallback.
+        return probe_with_ffmpeg(
+            video_path
+        )
+
 
     if result.returncode != 0:
 
-        error = result.stderr.decode(
-            "utf-8",
-            errors="ignore"
+        raise Exception(
+            result.stderr.strip()
         )
+
+
+    width = None
+    height = None
+
+
+    for line in result.stdout.splitlines():
+
+        if line.startswith(
+            "width="
+        ):
+
+            width = int(
+                line.split("=", 1)[1]
+            )
+
+
+        elif line.startswith(
+            "height="
+        ):
+
+            height = int(
+                line.split("=", 1)[1]
+            )
+
+
+    if not width or not height:
 
         raise Exception(
-            "FFmpeg could not open video: "
-            + error
+            "Unable to determine video resolution"
         )
 
 
+    return width, height
+
+
 # ============================================================
-# PERSISTENT FRAME DECODER
+# FFMPEG FALLBACK PROBE
 # ============================================================
 
-class FrameDecoder:
+def probe_with_ffmpeg(
+    video_path
+):
+
+    command = [
+
+        FFMPEG_PATH,
+
+        "-hide_banner",
+
+        "-i",
+
+        video_path
+
+    ]
+
+
+    result = subprocess.run(
+
+        command,
+
+        stdout=subprocess.PIPE,
+
+        stderr=subprocess.PIPE,
+
+        text=True,
+
+        timeout=30
+
+    )
+
+
+    output = result.stderr
+
+
+    import re
+
+
+    match = re.search(
+
+        r"Video:.*?(\d{2,5})x(\d{2,5})",
+
+        output
+
+    )
+
+
+    if not match:
+
+        raise Exception(
+            "Unable to determine source resolution"
+        )
+
+
+    width = int(
+        match.group(1)
+    )
+
+    height = int(
+        match.group(2)
+    )
+
+
+    return width, height
+
+
+# ============================================================
+# CALCULATE OUTPUT RESOLUTION
+# ============================================================
+
+def calculate_output_size(
+    source_width,
+    source_height
+):
+
+    # Never upscale.
+    if (
+        source_width <= MAX_WIDTH
+        and
+        source_height <= MAX_HEIGHT
+    ):
+
+        return (
+            source_width,
+            source_height
+        )
+
+
+    scale = min(
+
+        MAX_WIDTH / source_width,
+
+        MAX_HEIGHT / source_height
+
+    )
+
+
+    output_width = int(
+        source_width * scale
+    )
+
+    output_height = int(
+        source_height * scale
+    )
+
+
+    # RGBA images should use even dimensions.
+    output_width -= (
+        output_width % 2
+    )
+
+    output_height -= (
+        output_height % 2
+    )
+
+
+    output_width = max(
+        2,
+        output_width
+    )
+
+    output_height = max(
+        2,
+        output_height
+    )
+
+
+    return (
+        output_width,
+        output_height
+    )
+
+
+# ============================================================
+# VIDEO DECODER
+# ============================================================
+
+class VideoDecoder:
 
     def __init__(
         self,
-        video_path
+        video_path,
+        output_width,
+        output_height
     ):
 
         self.video_path = video_path
+
+        self.width = output_width
+
+        self.height = output_height
 
         self.process = None
 
@@ -349,31 +637,51 @@ class FrameDecoder:
             except Exception:
                 pass
 
+
+            try:
+                self.process.wait(
+                    timeout=1
+                )
+            except Exception:
+                pass
+
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # We only scale when needed.
+        #
+        # If the source is already <=720p, FFmpeg receives
+        # the source dimensions without a scale filter.
+        # ----------------------------------------------------
+
+        scale_filter = (
+            f"scale={self.width}:{self.height}"
+        )
+
+
         command = [
 
             FFMPEG_PATH,
 
             "-hide_banner",
+
             "-loglevel",
             "error",
 
-            # Input
             "-i",
             self.video_path,
 
-            # Video only
             "-an",
 
-            # Exact output frame rate
             "-vf",
+
             (
-                f"scale={WIDTH}:{HEIGHT}:"
-                "force_original_aspect_ratio=decrease,"
-                f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-                f"fps={FPS}"
+                scale_filter
+                + ",fps="
+                + str(TARGET_FPS)
             ),
 
-            # Raw RGBA
             "-pix_fmt",
             "rgba",
 
@@ -383,55 +691,84 @@ class FrameDecoder:
             "pipe:1"
         ]
 
+
         print(
-            "[FFmpeg] Starting persistent decoder"
+            "[FFmpeg] Starting decoder:",
+            self.width,
+            "x",
+            self.height,
+            "@",
+            TARGET_FPS
         )
 
+
         self.process = subprocess.Popen(
+
             command,
+
             stdout=subprocess.PIPE,
+
             stderr=subprocess.PIPE,
 
-            # Large pipes where supported.
             bufsize=1024 * 1024
         )
 
 
-    def read_frame(self):
+    def read_frame(
+        self
+    ):
 
         frame_size = (
-            WIDTH
-            * HEIGHT
+
+            self.width
+            * self.height
             * 4
+
         )
+
 
         with self.lock:
 
             if not self.process:
+
                 self.start()
 
+
             data = bytearray()
+
 
             while len(data) < frame_size:
 
                 chunk = self.process.stdout.read(
-                    frame_size - len(data)
+
+                    frame_size
+                    - len(data)
+
                 )
 
+
                 if not chunk:
+
                     break
 
-                data.extend(chunk)
+
+                data.extend(
+                    chunk
+                )
+
 
             if len(data) != frame_size:
 
                 print(
-                    "[FFmpeg] Decoder ended. Restarting."
+                    "[FFmpeg] End of video / decoder restart"
                 )
+
 
                 self.start()
 
+
                 return None
+
 
             return bytes(data)
 
@@ -443,26 +780,35 @@ class FrameDecoder:
 
         frames = []
 
+
         for _ in range(count):
 
             frame = self.read_frame()
 
+
             if frame is None:
+
                 break
 
-            frames.append(frame)
+
+            frames.append(
+                frame
+            )
+
 
         return frames
 
 
 # ============================================================
-# DECODER CACHE
+# GET DECODER
 # ============================================================
 
-DECODERS = {}
-
-
-def get_decoder(identifier, video_path):
+def get_decoder(
+    identifier,
+    video_path,
+    width,
+    height
+):
 
     with CACHE_LOCK:
 
@@ -470,76 +816,115 @@ def get_decoder(identifier, video_path):
             identifier
         )
 
+
         if decoder:
+
             return decoder
 
-        decoder = FrameDecoder(
-            video_path
+
+        decoder = VideoDecoder(
+
+            video_path,
+
+            width,
+
+            height
+
         )
 
-        DECODERS[identifier] = decoder
+
+        DECODERS[
+            identifier
+        ] = decoder
+
 
         return decoder
 
 
 # ============================================================
-# FRAME CACHE
+# GET FRAME CACHE
 # ============================================================
 
-def get_frame_cache(identifier):
+def get_frame_cache(
+    identifier
+):
 
     with CACHE_LOCK:
 
         if identifier not in FRAME_CACHE:
 
-            FRAME_CACHE[identifier] = OrderedDict()
+            FRAME_CACHE[
+                identifier
+            ] = OrderedDict()
 
-        return FRAME_CACHE[identifier]
+
+        return FRAME_CACHE[
+            identifier
+        ]
 
 
 # ============================================================
-# DECODE BATCH
+# DECODE FRAMES
 # ============================================================
 
-def decode_batch(
+def decode_frames(
+
     identifier,
+
     video_path,
+
+    width,
+
+    height,
+
     start_frame,
+
     count
+
 ):
 
     cache = get_frame_cache(
         identifier
     )
 
+
     result = []
 
-    # First use cached frames.
     missing = []
+
 
     with CACHE_LOCK:
 
-        for index in range(
+        for frame_number in range(
+
             start_frame,
+
             start_frame + count
+
         ):
 
             cached = cache.get(
-                index
+                frame_number
             )
+
 
             if cached is not None:
 
                 result.append(
-                    (index, cached)
+                    (
+                        frame_number,
+                        cached
+                    )
                 )
 
             else:
 
-                missing.append(index)
+                missing.append(
+                    frame_number
+                )
 
 
-    # If everything was cached.
+    # Everything was cached.
     if not missing:
 
         result.sort(
@@ -549,53 +934,64 @@ def decode_batch(
         return result
 
 
-    # Current implementation decodes sequentially.
-    #
-    # FFmpeg itself handles decoding internally.
-    # We avoid starting a separate FFmpeg process
-    # for every frame.
-
     decoder = get_decoder(
+
         identifier,
-        video_path
+
+        video_path,
+
+        width,
+
+        height
+
     )
 
-    # If we're asking for frame 0, decode normally.
-    #
-    # For later requests the persistent decoder continues
-    # forward. This endpoint is intended to be consumed
-    # sequentially by the Roblox server.
 
     frames = decoder.read_frames(
         len(missing)
     )
 
-    for index, frame in zip(
+
+    for frame_number, frame in zip(
+
         missing,
+
         frames
+
     ):
 
         with CACHE_LOCK:
 
-            cache[index] = frame
+            cache[
+                frame_number
+            ] = frame
 
             cache.move_to_end(
-                index
+                frame_number
             )
 
-            while len(cache) > MAX_FRAME_CACHE:
+
+            while len(cache) > MAX_CACHE_FRAMES:
 
                 cache.popitem(
                     last=False
                 )
 
+
         result.append(
-            (index, frame)
+
+            (
+                frame_number,
+                frame
+            )
+
         )
+
 
     result.sort(
         key=lambda x: x[0]
     )
+
 
     return result
 
@@ -612,18 +1008,23 @@ def home():
         "success": True,
 
         "message":
-            "Roblox Internet Archive "
-            "480p/30 FPS frame server",
+            "Internet Archive Roblox video server",
 
-        "width": WIDTH,
+        "max_width":
+            MAX_WIDTH,
 
-        "height": HEIGHT,
+        "max_height":
+            MAX_HEIGHT,
 
-        "fps": FPS,
+        "fps":
+            TARGET_FPS,
 
-        "codec": "RGBA",
+        "format":
+            "RGBA",
 
-        "mode": "persistent-ffmpeg"
+        "mode":
+            "source-resolution-max-720p"
+
     })
 
 
@@ -638,41 +1039,80 @@ def video():
         "url"
     )
 
+
     if not archive_url:
 
         return jsonify({
 
             "success": False,
 
-            "error": "Missing url"
+            "error":
+                "Missing url"
 
         }), 400
 
 
-    if "archive.org/details/" not in archive_url:
+    if (
+        "archive.org/details/"
+        not in archive_url
+    ):
 
         return jsonify({
 
             "success": False,
 
             "error":
-                "Only Internet Archive URLs "
-                "are supported"
+                "Only Internet Archive URLs are supported"
 
         }), 400
 
 
     try:
 
-        info = get_archive_video(
+        info = get_video(
             archive_url
         )
 
-        # Make sure the video can actually
-        # be downloaded.
-        get_video(
-            archive_url
+
+        source_width, source_height = (
+            probe_video(
+                info["path"]
+            )
         )
+
+
+        output_width, output_height = (
+            calculate_output_size(
+
+                source_width,
+
+                source_height
+
+            )
+        )
+
+
+        print(
+            "[Video] Source:",
+            source_width,
+            "x",
+            source_height
+        )
+
+
+        print(
+            "[Video] Output:",
+            output_width,
+            "x",
+            output_height
+        )
+
+
+        print(
+            "[Video] FPS:",
+            TARGET_FPS
+        )
+
 
         return jsonify({
 
@@ -681,26 +1121,34 @@ def video():
             "identifier":
                 info["identifier"],
 
-            "url":
-                info["url"],
-
             "filename":
                 info["filename"],
 
-            "size":
-                info["size"],
+            "sourceWidth":
+                source_width,
+
+            "sourceHeight":
+                source_height,
 
             "width":
-                WIDTH,
+                output_width,
 
             "height":
-                HEIGHT,
+                output_height,
 
             "fps":
-                FPS,
+                TARGET_FPS,
 
             "codec":
-                "RGBA"
+                "RGBA",
+
+            "scaled":
+                (
+                    output_width != source_width
+                    or
+                    output_height != source_height
+                )
+
         })
 
 
@@ -708,14 +1156,16 @@ def video():
 
         print(
             "[Video] Error:",
-            error
+            repr(error)
         )
+
 
         return jsonify({
 
             "success": False,
 
-            "error": str(error)
+            "error":
+                str(error)
 
         }), 500
 
@@ -731,14 +1181,16 @@ def frames():
         "url"
     )
 
-    start = request.args.get(
+
+    start_string = request.args.get(
         "start",
         "0"
     )
 
-    count = request.args.get(
+
+    count_string = request.args.get(
         "count",
-        str(BATCH_SIZE)
+        "3"
     )
 
 
@@ -748,14 +1200,21 @@ def frames():
 
             "success": False,
 
-            "error": "Missing url"
+            "error":
+                "Missing url"
 
         }), 400
 
 
     try:
 
-        start = int(start)
+        start_frame = max(
+
+            0,
+
+            int(start_string)
+
+        )
 
     except ValueError:
 
@@ -763,34 +1222,26 @@ def frames():
 
             "success": False,
 
-            "error": "Invalid start"
+            "error":
+                "Invalid start"
 
         }), 400
 
 
     try:
 
-        count = int(count)
+        count = int(
+            count_string
+        )
 
     except ValueError:
 
-        return jsonify({
+        count = 3
 
-            "success": False,
-
-            "error": "Invalid count"
-
-        }), 400
-
-
-    start = max(
-        0,
-        start
-    )
 
     count = max(
         1,
-        min(count, 60)
+        min(count, MAX_BATCH)
     )
 
 
@@ -800,25 +1251,46 @@ def frames():
             archive_url
         )
 
-        identifier = info[
-            "identifier"
-        ]
 
-        frames = decode_batch(
+        source_width, source_height = (
+            probe_video(
+                info["path"]
+            )
+        )
 
-            identifier,
+
+        output_width, output_height = (
+            calculate_output_size(
+
+                source_width,
+
+                source_height
+
+            )
+        )
+
+
+        frames = decode_frames(
+
+            info["identifier"],
 
             info["path"],
 
-            start,
+            output_width,
+
+            output_height,
+
+            start_frame,
 
             count
+
         )
 
 
         encoded_frames = []
 
-        for frame_number, raw in frames:
+
+        for frame_number, raw_frame in frames:
 
             encoded_frames.append({
 
@@ -827,8 +1299,11 @@ def frames():
 
                 "data":
                     base64.b64encode(
-                        raw
-                    ).decode("ascii")
+                        raw_frame
+                    ).decode(
+                        "ascii"
+                    )
+
             })
 
 
@@ -836,17 +1311,14 @@ def frames():
 
             "success": True,
 
-            "identifier":
-                identifier,
-
             "width":
-                WIDTH,
+                output_width,
 
             "height":
-                HEIGHT,
+                output_height,
 
             "fps":
-                FPS,
+                TARGET_FPS,
 
             "frames":
                 encoded_frames
@@ -858,134 +1330,16 @@ def frames():
 
         print(
             "[Frames] Error:",
-            error
+            repr(error)
         )
 
-        return jsonify({
-
-            "success": False,
-
-            "error": str(error)
-
-        }), 500
-
-
-# ============================================================
-# LEGACY SINGLE FRAME
-# ============================================================
-
-@app.route("/frame")
-def frame():
-
-    archive_url = request.args.get(
-        "url"
-    )
-
-    frame_number = request.args.get(
-        "frame",
-        "0"
-    )
-
-
-    if not archive_url:
-
-        return jsonify({
-
-            "success": False,
-
-            "error": "Missing url"
-
-        }), 400
-
-
-    try:
-
-        frame_number = int(
-            frame_number
-        )
-
-    except ValueError:
 
         return jsonify({
 
             "success": False,
 
             "error":
-                "Invalid frame number"
-
-        }), 400
-
-
-    try:
-
-        info = get_video(
-            archive_url
-        )
-
-        identifier = info[
-            "identifier"
-        ]
-
-        result = decode_batch(
-
-            identifier,
-
-            info["path"],
-
-            max(
-                0,
-                frame_number
-            ),
-
-            1
-        )
-
-
-        if not result:
-
-            raise Exception(
-                "No frame returned"
-            )
-
-
-        actual_frame, raw = result[0]
-
-
-        return jsonify({
-
-            "success": True,
-
-            "frame":
-                actual_frame,
-
-            "width":
-                WIDTH,
-
-            "height":
-                HEIGHT,
-
-            "format":
-                "rgba",
-
-            "data":
-                base64.b64encode(
-                    raw
-                ).decode("ascii")
-        })
-
-
-    except Exception as error:
-
-        print(
-            "[Frame] Error:",
-            error
-        )
-
-        return jsonify({
-
-            "success": False,
-
-            "error": str(error)
+                str(error)
 
         }), 500
 
@@ -1003,6 +1357,7 @@ if __name__ == "__main__":
         )
     )
 
+
     app.run(
 
         host="0.0.0.0",
@@ -1010,4 +1365,5 @@ if __name__ == "__main__":
         port=port,
 
         threaded=True
+
     )
