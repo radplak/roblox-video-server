@@ -9,6 +9,7 @@ import tempfile
 
 import numpy as np
 import requests
+import zstandard as zstd
 from flask import Flask, request, jsonify, Response
 
 app = Flask(__name__)
@@ -168,33 +169,21 @@ def get_video_info(path):
 
 
 # ============================================================
-# DELTA + RLE "CODEC"
+# DELTA + ZSTD "CODEC"
 #
 # Each frame is XORed against the previously decoded raw frame
-# (frame 0 is XORed against all-zero), then run-length encoded.
-# Static regions collapse to near-nothing; this is a real,
-# if simple, inter-frame compressor - not just a transport tweak.
+# (frame 0 is XORed against all-zero), then compressed with Zstd
+# - the same (and only) algorithm Roblox's EncodingService can
+# decompress natively via EncodingService:DecompressBuffer(). Both
+# ends do the heavy lifting in C, not interpreted Python/Luau loops,
+# which is what a real-time 30fps budget actually requires.
 # ============================================================
 
-def rle_encode(data: bytes) -> bytes:
-    arr = np.frombuffer(data, dtype=np.uint8)
-    if arr.size == 0:
-        return b""
-    change_idx = np.nonzero(np.diff(arr))[0] + 1
-    starts = np.concatenate(([0], change_idx))
-    ends = np.concatenate((change_idx, [arr.size]))
-    lengths = (ends - starts).tolist()
-    values = arr[starts].tolist()
+_zstd_compressor = zstd.ZstdCompressor(level=3)
 
-    out = bytearray()
-    for length, value in zip(lengths, values):
-        while length > 255:
-            out.append(255)
-            out.append(value)
-            length -= 255
-        out.append(length)
-        out.append(value)
-    return bytes(out)
+
+def encode_frame_payload(delta_bytes: bytes) -> bytes:
+    return _zstd_compressor.compress(delta_bytes)
 
 
 # ============================================================
@@ -250,7 +239,7 @@ class ExtractionJob:
 
                 if not os.path.exists(out_path):
                     delta = np.bitwise_xor(current, previous).tobytes()
-                    encoded = rle_encode(delta)
+                    encoded = encode_frame_payload(delta)
                     tmp_path = out_path + ".part"
                     with open(tmp_path, "wb") as f:
                         f.write(encoded)
@@ -298,7 +287,7 @@ def index():
         "service": "Roblox Video Server",
         "resolution": f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         "fps": TARGET_FPS,
-        "codec": "delta+rle",
+        "codec": "delta+zstd",
     })
 
 
@@ -328,7 +317,7 @@ def video_info():
             "width": OUTPUT_WIDTH,
             "height": OUTPUT_HEIGHT,
             "fps": TARGET_FPS,
-            "codec": "delta+rle",
+            "codec": "delta+zstd",
             "totalFramesEstimate": job.total_estimate,
         })
 
