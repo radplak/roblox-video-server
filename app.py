@@ -7,6 +7,7 @@ from urllib.parse import urlparse, quote
 import subprocess
 
 import numpy as np
+import scipy.io.wavfile as wav
 import requests
 import zstandard as zstd
 from flask import Flask, request, jsonify, Response
@@ -14,13 +15,16 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG (OPTIMIZED FOR STABLE STREAMING)
+# CONFIG (OPTIMIZED FOR STABLE STREAMING WITH AUDIO)
 # ============================================================
 
 OUTPUT_WIDTH = 320
 OUTPUT_HEIGHT = 180
 TARGET_FPS = 24
 FRAME_SIZE = OUTPUT_WIDTH * OUTPUT_HEIGHT * 4  # RGBA
+
+NUM_AUDIO_CHANNELS = 4  # Number of dominant sine wave frequencies to extract
+AUDIO_SAMPLE_RATE = 22050
 
 REQUEST_TIMEOUT = 60
 ARCHIVE_HEADERS = {"User-Agent": "RobloxVideoStreamer/1.0"}
@@ -162,7 +166,7 @@ def get_video_info(path):
 
 
 # ============================================================
-# CODEC
+# CODEC & AUDIO EXTRACTION
 # ============================================================
 
 _zstd_compressor = zstd.ZstdCompressor(level=3)
@@ -170,6 +174,53 @@ _zstd_compressor = zstd.ZstdCompressor(level=3)
 
 def encode_frame_payload(delta_bytes: bytes) -> bytes:
     return _zstd_compressor.compress(delta_bytes)
+
+
+def extract_full_audio_track(video_path, wav_path):
+    """Extracts 16-bit mono PCM audio from video using FFmpeg."""
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-vn", "-ac", "1", "-ar", str(AUDIO_SAMPLE_RATE),
+        "-acodec", "pcm_s16le", wav_path
+    ]
+    subprocess.run(command, check=True)
+
+
+def get_audio_features_for_frame(audio_data, frame_index, samples_per_frame):
+    """
+    Runs Fast Fourier Transform (FFT) on the frame's audio slice
+    to return top N dominant frequencies and volumes.
+    """
+    start = frame_index * samples_per_frame
+    end = start + samples_per_frame
+    chunk = audio_data[start:end]
+
+    audio_bytes = bytearray()
+    
+    if len(chunk) == samples_per_frame:
+        # Window function to minimize spectral leakage
+        windowed = chunk * np.hanning(len(chunk))
+        fft_data = np.abs(np.fft.rfft(windowed))
+        freqs = np.fft.rfftfreq(len(chunk), 1.0 / AUDIO_SAMPLE_RATE)
+
+        # Get top N highest energy frequencies
+        peak_indices = np.argsort(fft_data)[-NUM_AUDIO_CHANNELS:][::-1]
+        max_possible_mag = (samples_per_frame * 32768) / 2
+
+        for idx in peak_indices:
+            freq = int(freqs[idx])
+            magnitude = fft_data[idx] / max_possible_mag
+            volume = min(1.0, float(magnitude * 3.5))  # Moderate gain boost
+            vol_byte = int(volume * 255)
+
+            # Pack 2 bytes frequency (big endian short), 1 byte volume (unsigned char)
+            audio_bytes.extend(struct.pack(">HB", freq, vol_byte))
+    else:
+        # Silence padding if audio stream ends before video stream
+        audio_bytes.extend(b"\x00" * (NUM_AUDIO_CHANNELS * 3))
+
+    return bytes(audio_bytes)
 
 
 # ============================================================
@@ -197,6 +248,18 @@ class ExtractionJob:
 
     def run(self):
         try:
+            # 1. Extract and process audio track via WAV
+            wav_path = os.path.join(self.frames_dir, "audio.wav")
+            audio_data = np.array([], dtype=np.int16)
+            samples_per_frame = int(AUDIO_SAMPLE_RATE / TARGET_FPS)
+
+            try:
+                extract_full_audio_track(self.video_path, wav_path)
+                _, audio_data = wav.read(wav_path)
+            except Exception as audio_err:
+                log("Audio extraction failed/silent for", self.identifier, repr(audio_err))
+
+            # 2. Extract video stream using FFmpeg pipe
             vf = (
                 f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
                 f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=rgba"
@@ -225,11 +288,20 @@ class ExtractionJob:
                 current = np.frombuffer(raw, dtype=np.uint8)
 
                 if not os.path.exists(out_path):
+                    # Compute delta image bytes
                     delta = np.bitwise_xor(current, previous).tobytes()
-                    encoded = encode_frame_payload(delta)
+                    encoded_video = encode_frame_payload(delta)
+
+                    # Compute audio sine bytes for this frame (12 bytes)
+                    audio_payload = get_audio_features_for_frame(audio_data, index, samples_per_frame)
+
+                    # Structure frame on disk: [2-byte audio len][12-byte audio payload][compressed video payload]
+                    header = struct.pack("<H", len(audio_payload))
+                    full_payload = header + audio_payload + encoded_video
+
                     tmp_path = out_path + ".part"
                     with open(tmp_path, "wb") as f:
-                        f.write(encoded)
+                        f.write(full_payload)
                     os.replace(tmp_path, out_path)
 
                 previous = current
@@ -246,6 +318,10 @@ class ExtractionJob:
 
             process.stdout.close()
             process.wait(timeout=5)
+
+            # Cleanup temporary wav file
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
 
             with self.lock:
                 self.done = True
@@ -278,10 +354,11 @@ def get_or_start_job(identifier, video_path, duration_hint):
 def index():
     return jsonify({
         "status": "ok",
-        "service": "Roblox Video Server",
+        "service": "Roblox Video & Audio Server",
         "resolution": f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         "fps": TARGET_FPS,
-        "codec": "delta+zstd",
+        "audioChannels": NUM_AUDIO_CHANNELS,
+        "codec": "delta+zstd+sine_audio",
     })
 
 
@@ -311,7 +388,8 @@ def video_info():
             "width": OUTPUT_WIDTH,
             "height": OUTPUT_HEIGHT,
             "fps": TARGET_FPS,
-            "codec": "delta+zstd",
+            "audioChannels": NUM_AUDIO_CHANNELS,
+            "codec": "delta+zstd+sine_audio",
             "totalFramesEstimate": job.total_estimate,
         })
 
@@ -370,6 +448,7 @@ def frames():
             "X-Frame-Count": str(sent),
             "X-Width": str(OUTPUT_WIDTH),
             "X-Height": str(OUTPUT_HEIGHT),
+            "X-Audio-Channels": str(NUM_AUDIO_CHANNELS),
             "X-Complete": "1" if done else "0",
             "X-Frames-Ready": str(ready),
         }
