@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: roblox-internet-archive-video
+    name: roblox-video-stream
     runtime: docker
     dockerfilePath: ./Dockerfile
-    autoDeploy: true
+    healthCheckPath: /
