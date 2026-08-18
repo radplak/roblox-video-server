@@ -3,6 +3,4 @@ services:
     name: roblox-internet-archive-video
     runtime: docker
     dockerfilePath: ./Dockerfile
-    dockerContext: .
-    healthCheckPath: /
-    plan: free
+    autoDeploy: true
