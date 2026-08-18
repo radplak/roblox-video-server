@@ -1,10 +1,7 @@
-from flask import Flask, jsonify
-import base64
+from flask import Flask, request, jsonify
+from urllib.parse import urlparse, parse_qs
 
 app = Flask(__name__)
-
-WIDTH = 160
-HEIGHT = 90
 
 
 @app.route("/")
@@ -20,28 +17,43 @@ def test():
     })
 
 
-@app.route("/frame")
-def frame():
-    # Create a simple test frame.
-    # Each pixel is RGB: red, green, blue.
-    pixels = bytearray()
+@app.route("/load", methods=["GET", "POST"])
+def load_video():
 
-    for y in range(HEIGHT):
-        for x in range(WIDTH):
-            # Moving-looking gradient based on position
-            r = int((x / WIDTH) * 255)
-            g = int((y / HEIGHT) * 255)
-            b = 120
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        url = body.get("url", "")
+    else:
+        url = request.args.get("url", "")
 
-            pixels.extend([r, g, b])
+    if not url:
+        return jsonify({
+            "success": False,
+            "error": "No YouTube URL was provided."
+        }), 400
 
-    encoded = base64.b64encode(pixels).decode("ascii")
+    # Extract YouTube video ID
+    video_id = None
+
+    parsed = urlparse(url)
+
+    if parsed.hostname in ("youtube.com", "www.youtube.com"):
+        query = parse_qs(parsed.query)
+        video_id = query.get("v", [None])[0]
+
+    elif parsed.hostname == "youtu.be":
+        video_id = parsed.path.strip("/")
+
+    if not video_id:
+        return jsonify({
+            "success": False,
+            "error": "Invalid YouTube URL."
+        }), 400
 
     return jsonify({
-        "width": WIDTH,
-        "height": HEIGHT,
-        "format": "RGB24",
-        "data": encoded
+        "success": True,
+        "video_id": video_id,
+        "message": "YouTube URL received!"
     })
 
 
