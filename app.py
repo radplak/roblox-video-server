@@ -2,10 +2,12 @@ from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 import yt_dlp
 import os
+import shutil
+import tempfile
 
 app = Flask(__name__)
 
-COOKIE_FILE = "/etc/secrets/cookies.txt"
+SECRET_COOKIE_FILE = "/etc/secrets/cookies.txt"
 
 
 @app.route("/")
@@ -15,13 +17,14 @@ def home():
 
 @app.route("/test")
 def test():
-    file_exists = os.path.isfile(COOKIE_FILE)
+    file_exists = os.path.isfile(SECRET_COOKIE_FILE)
 
     return jsonify({
         "success": True,
         "message": "Roblox connected successfully!",
         "file_exists": file_exists,
-        "file_size": os.path.getsize(COOKIE_FILE) if file_exists else 0
+        "file_size": os.path.getsize(SECRET_COOKIE_FILE)
+        if file_exists else 0
     })
 
 
@@ -53,6 +56,8 @@ def load_video():
             "error": "Invalid YouTube URL."
         }), 400
 
+    temporary_cookie_file = None
+
     try:
 
         options = {
@@ -61,8 +66,21 @@ def load_video():
             "noplaylist": True,
         }
 
-        if os.path.isfile(COOKIE_FILE):
-            options["cookiefile"] = COOKIE_FILE
+        # Copy the read-only Render Secret File
+        # into /tmp, which is writable.
+        if os.path.isfile(SECRET_COOKIE_FILE):
+
+            temporary_cookie_file = os.path.join(
+                tempfile.gettempdir(),
+                "youtube_cookies.txt"
+            )
+
+            shutil.copyfile(
+                SECRET_COOKIE_FILE,
+                temporary_cookie_file
+            )
+
+            options["cookiefile"] = temporary_cookie_file
 
         with yt_dlp.YoutubeDL(options) as ydl:
 
@@ -87,6 +105,17 @@ def load_video():
             "success": False,
             "error": str(e)
         }), 500
+
+    finally:
+
+        # Delete the temporary copy when we're finished.
+        if temporary_cookie_file and os.path.exists(
+            temporary_cookie_file
+        ):
+            try:
+                os.remove(temporary_cookie_file)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
