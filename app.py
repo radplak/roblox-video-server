@@ -71,6 +71,16 @@ def find_video_file(metadata):
     candidates = mp4s or others
     if not candidates:
         raise ValueError("No supported video file was found.")
+
+    # Prefer archive.org's own transcoded "*.ia.mp4" derivative when present:
+    # it's purpose-built for streaming, much smaller than raw uploads, and
+    # since we downscale to 480p anyway, source quality beyond that is wasted
+    # bandwidth. Falling back to raw originals only when no derivative exists.
+    ia_derivatives = [f for f in candidates if f.get("name", "").lower().endswith(".ia.mp4")]
+    if ia_derivatives:
+        ia_derivatives.sort(key=lambda f: int(f.get("size", 0) or 0))
+        return ia_derivatives[0]
+
     candidates.sort(key=lambda f: -int(f.get("size", 0) or 0))
     return candidates[0]
 
