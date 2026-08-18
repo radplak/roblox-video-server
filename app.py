@@ -1,8 +1,12 @@
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
 import yt_dlp
+import os
+import tempfile
 
 app = Flask(__name__)
+
+COOKIES = os.environ.get("YOUTUBE_COOKIES", "")
 
 
 @app.route("/")
@@ -14,7 +18,8 @@ def home():
 def test():
     return jsonify({
         "success": True,
-        "message": "Roblox connected successfully!"
+        "message": "Roblox connected successfully!",
+        "cookies_configured": bool(COOKIES)
     })
 
 
@@ -46,6 +51,8 @@ def load_video():
             "error": "Invalid YouTube URL."
         }), 400
 
+    cookie_file = None
+
     try:
 
         options = {
@@ -54,8 +61,27 @@ def load_video():
             "noplaylist": True,
         }
 
+        # If cookies were configured in Render,
+        # create a temporary cookie file for yt-dlp.
+        if COOKIES:
+
+            cookie_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".txt",
+                delete=False
+            )
+
+            cookie_file.write(COOKIES)
+            cookie_file.close()
+
+            options["cookiefile"] = cookie_file.name
+
         with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
 
         return jsonify({
             "success": True,
@@ -64,7 +90,7 @@ def load_video():
             "duration": info.get("duration"),
             "width": info.get("width"),
             "height": info.get("height"),
-            "fps": info.get("fps"),
+            "fps": info.get("fps")
         })
 
     except Exception as e:
@@ -74,6 +100,18 @@ def load_video():
             "error": str(e)
         }), 500
 
+    finally:
+
+        if cookie_file:
+
+            try:
+                os.unlink(cookie_file.name)
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(
+        host="0.0.0.0",
+        port=10000
+    )
