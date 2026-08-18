@@ -1,8 +1,10 @@
 ```python
-from flask import Flask, request, jsonify
-import requests
+import os
 import re
 from urllib.parse import urlparse
+
+import requests
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
@@ -10,20 +12,30 @@ IA_METADATA = "https://archive.org/metadata/{}"
 
 
 def get_identifier(url):
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
 
-    if parsed.netloc not in ("archive.org", "www.archive.org"):
+        if parsed.netloc.lower() not in (
+            "archive.org",
+            "www.archive.org",
+        ):
+            return None
+
+        match = re.match(
+            r"^/details/([^/?#]+)",
+            parsed.path,
+        )
+
+        if not match:
+            return None
+
+        return match.group(1)
+
+    except Exception:
         return None
 
-    match = re.match(r"^/details/([^/?#]+)", parsed.path)
 
-    if not match:
-        return None
-
-    return match.group(1)
-
-
-@app.route("/")
+@app.get("/")
 def index():
     return jsonify({
         "success": True,
@@ -31,9 +43,9 @@ def index():
     })
 
 
-@app.route("/video")
+@app.get("/video")
 def video():
-    url = request.args.get("url")
+    url = request.args.get("url", "").strip()
 
     if not url:
         return jsonify({
@@ -52,65 +64,83 @@ def video():
     try:
         response = requests.get(
             IA_METADATA.format(identifier),
-            timeout=20
+            timeout=20,
         )
 
         response.raise_for_status()
         metadata = response.json()
 
-    except Exception as e:
+    except requests.RequestException as e:
         return jsonify({
             "success": False,
-            "error": f"Unable to access Internet Archive: {str(e)}"
+            "error": f"Internet Archive request failed: {e}"
+        }), 502
+
+    except ValueError:
+        return jsonify({
+            "success": False,
+            "error": "Internet Archive returned invalid JSON"
         }), 502
 
     files = metadata.get("files", [])
 
-    video_files = []
+    candidates = []
 
     for file in files:
-        name = file.get("name", "")
-        fmt = str(file.get("format", "")).lower()
+        name = str(file.get("name", ""))
+        file_format = str(file.get("format", "")).lower()
 
         if (
-            fmt in ("mpeg4", "h.264", "mp4")
-            or name.lower().endswith(".mp4")
+            name.lower().endswith(".mp4")
+            or file_format in ("mpeg4", "mp4", "h.264")
         ):
-            video_files.append(file)
+            size = file.get("size", 0)
 
-    if not video_files:
+            try:
+                size = int(size)
+            except (TypeError, ValueError):
+                size = 0
+
+            candidates.append({
+                "name": name,
+                "format": file.get("format"),
+                "size": size,
+            })
+
+    if not candidates:
         return jsonify({
             "success": False,
-            "error": "No MP4 video was found for this item"
+            "error": "No MP4 video was found"
         }), 404
 
-    # Prefer the largest MP4 available.
-    video_files.sort(
-        key=lambda x: int(x.get("size", 0) or 0),
-        reverse=True
+    candidates.sort(
+        key=lambda item: item["size"],
+        reverse=True,
     )
 
-    selected = video_files[0]
-    filename = selected["name"]
+    selected = candidates[0]
 
     direct_url = (
         f"https://archive.org/download/"
-        f"{identifier}/{filename}"
+        f"{identifier}/"
+        f"{selected['name']}"
     )
 
     return jsonify({
         "success": True,
         "identifier": identifier,
-        "filename": filename,
+        "filename": selected["name"],
+        "format": selected["format"],
+        "size": selected["size"],
         "url": direct_url,
-        "size": selected.get("size"),
-        "format": selected.get("format")
     })
 
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+
     app.run(
         host="0.0.0.0",
-        port=5000
+        port=port,
     )
 ```
