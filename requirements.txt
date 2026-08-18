@@ -3,3 +3,4 @@ requests
 gunicorn
 imageio-ffmpeg
 numpy
+zstandard
