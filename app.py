@@ -2,7 +2,6 @@ import os
 import tempfile
 import threading
 import subprocess
-from urllib.parse import unquote
 
 import requests
 import imageio_ffmpeg
@@ -15,8 +14,8 @@ app = Flask(__name__)
 VIDEO_CACHE = {}
 CACHE_LOCK = threading.Lock()
 
-WIDTH = 160
-HEIGHT = 90
+WIDTH = 80
+HEIGHT = 45
 FPS = 10
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -69,7 +68,6 @@ def get_archive_video(archive_url):
     if not videos:
         raise Exception("No MP4 file found")
 
-    # Largest MP4
     videos.sort(
         key=lambda x: x["size"],
         reverse=True
@@ -181,10 +179,7 @@ def get_video(archive_url):
     return info
 
 
-def extract_frame(video_path, frame_number):
-    if frame_number < 0:
-        frame_number = 0
-
+def extract_raw_frame(video_path, frame_number):
     timestamp = frame_number / FPS
 
     command = [
@@ -207,10 +202,10 @@ def extract_frame(video_path, frame_number):
         f"scale={WIDTH}:{HEIGHT}",
 
         "-f",
-        "image2pipe",
+        "rawvideo",
 
-        "-vcodec",
-        "png",
+        "-pix_fmt",
+        "rgba",
 
         "pipe:1"
     ]
@@ -233,9 +228,13 @@ def extract_frame(video_path, frame_number):
             error or "FFmpeg failed"
         )
 
-    if not result.stdout:
+    expected_size = WIDTH * HEIGHT * 4
+
+    if len(result.stdout) != expected_size:
         raise Exception(
-            "FFmpeg returned an empty frame"
+            f"Invalid frame size: "
+            f"{len(result.stdout)} "
+            f"expected {expected_size}"
         )
 
     return result.stdout
@@ -248,7 +247,8 @@ def home():
         "success": True,
         "message": "Roblox Internet Archive video server is running",
         "resolution": f"{WIDTH}x{HEIGHT}",
-        "fps": FPS
+        "fps": FPS,
+        "format": "RGBA"
     })
 
 
@@ -334,16 +334,19 @@ def frame():
 
         info = get_video(url)
 
-        png_data = extract_frame(
+        raw_data = extract_raw_frame(
             info["path"],
             frame_number
         )
 
         return Response(
-            png_data,
-            mimetype="image/png",
+            raw_data,
+            mimetype="application/octet-stream",
             headers={
-                "Cache-Control": "public, max-age=31536000"
+                "X-Video-Width": str(WIDTH),
+                "X-Video-Height": str(HEIGHT),
+                "X-Video-FPS": str(FPS),
+                "Cache-Control": "no-cache"
             }
         )
 
@@ -353,45 +356,6 @@ def frame():
             "[Video] Frame error:",
             e
         )
-
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-@app.route("/info")
-def info():
-
-    url = request.args.get("url")
-
-    if not url:
-        return jsonify({
-            "success": False,
-            "error": "Missing url"
-        }), 400
-
-    if "archive.org/details/" not in url:
-        return jsonify({
-            "success": False,
-            "error": "Only Internet Archive URLs are supported"
-        }), 400
-
-    try:
-
-        video_info = get_archive_video(url)
-
-        return jsonify({
-            "success": True,
-            "identifier": video_info["identifier"],
-            "filename": video_info["filename"],
-            "size": video_info["size"],
-            "width": WIDTH,
-            "height": HEIGHT,
-            "fps": FPS
-        })
-
-    except Exception as e:
 
         return jsonify({
             "success": False,
