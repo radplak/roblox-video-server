@@ -1,13 +1,13 @@
 import os
-import base64
 import tempfile
 import threading
 import subprocess
+from urllib.parse import unquote
 
 import requests
 import imageio_ffmpeg
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 
 
 app = Flask(__name__)
@@ -23,12 +23,21 @@ FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def get_archive_video(archive_url):
+    archive_url = archive_url.strip()
+
+    if "/details/" not in archive_url:
+        raise Exception("Invalid Internet Archive URL")
+
     identifier = (
         archive_url
         .split("/details/", 1)[1]
         .split("?", 1)[0]
         .split("#", 1)[0]
+        .strip("/")
     )
+
+    if not identifier:
+        raise Exception("Missing Internet Archive identifier")
 
     response = requests.get(
         f"https://archive.org/metadata/{identifier}",
@@ -44,20 +53,23 @@ def get_archive_video(archive_url):
     for file in data.get("files", []):
         name = file.get("name", "")
 
-        if name.lower().endswith(".mp4"):
-            try:
-                size = int(file.get("size", 0))
-            except Exception:
-                size = 0
+        if not name.lower().endswith(".mp4"):
+            continue
 
-            videos.append({
-                "name": name,
-                "size": size
-            })
+        try:
+            size = int(file.get("size", 0))
+        except Exception:
+            size = 0
+
+        videos.append({
+            "name": name,
+            "size": size
+        })
 
     if not videos:
         raise Exception("No MP4 file found")
 
+    # Largest MP4
     videos.sort(
         key=lambda x: x["size"],
         reverse=True
@@ -90,42 +102,53 @@ def download_video(url, identifier):
         exist_ok=True
     )
 
+    safe_identifier = identifier.replace("/", "_")
+
     filename = os.path.join(
         cache_dir,
-        identifier + ".mp4"
+        safe_identifier + ".mp4"
     )
 
     if os.path.exists(filename):
         if os.path.getsize(filename) > 0:
+            print("[Video] Using cached video:", filename)
             return filename
 
     temp_filename = filename + ".download"
 
     print("[Video] Downloading:", url)
 
-    with requests.get(
-        url,
-        stream=True,
-        timeout=60
-    ) as response:
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=60
+        ) as response:
 
-        response.raise_for_status()
+            response.raise_for_status()
 
-        with open(
+            with open(
+                temp_filename,
+                "wb"
+            ) as file:
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+
+                    if chunk:
+                        file.write(chunk)
+
+        os.replace(
             temp_filename,
-            "wb"
-        ) as file:
+            filename
+        )
 
-            for chunk in response.iter_content(
-                chunk_size=1024 * 1024
-            ):
-                if chunk:
-                    file.write(chunk)
+    except Exception:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
-    os.replace(
-        temp_filename,
-        filename
-    )
+        raise
 
     print("[Video] Download complete:", filename)
 
@@ -133,20 +156,16 @@ def download_video(url, identifier):
 
 
 def get_video(archive_url):
-    info = get_archive_video(
-        archive_url
-    )
+    info = get_archive_video(archive_url)
 
     identifier = info["identifier"]
 
     with CACHE_LOCK:
 
-        if identifier in VIDEO_CACHE:
+        cached = VIDEO_CACHE.get(identifier)
 
-            info["path"] = VIDEO_CACHE[
-                identifier
-            ]
-
+        if cached and os.path.exists(cached):
+            info["path"] = cached
             return info
 
     path = download_video(
@@ -155,7 +174,6 @@ def get_video(archive_url):
     )
 
     with CACHE_LOCK:
-
         VIDEO_CACHE[identifier] = path
 
     info["path"] = path
@@ -164,6 +182,8 @@ def get_video(archive_url):
 
 
 def extract_frame(video_path, frame_number):
+    if frame_number < 0:
+        frame_number = 0
 
     timestamp = frame_number / FPS
 
@@ -209,7 +229,9 @@ def extract_frame(video_path, frame_number):
             errors="ignore"
         )
 
-        raise Exception(error)
+        raise Exception(
+            error or "FFmpeg failed"
+        )
 
     if not result.stdout:
         raise Exception(
@@ -224,7 +246,7 @@ def home():
 
     return jsonify({
         "success": True,
-        "message": "Video frame server is running",
+        "message": "Roblox Internet Archive video server is running",
         "resolution": f"{WIDTH}x{HEIGHT}",
         "fps": FPS
     })
@@ -236,14 +258,12 @@ def video():
     url = request.args.get("url")
 
     if not url:
-
         return jsonify({
             "success": False,
             "error": "Missing url"
         }), 400
 
     if "archive.org/details/" not in url:
-
         return jsonify({
             "success": False,
             "error": "Only Internet Archive URLs are supported"
@@ -251,35 +271,26 @@ def video():
 
     try:
 
-        info = get_archive_video(
-            url
-        )
+        info = get_archive_video(url)
 
         return jsonify({
-
             "success": True,
-
+            "identifier": info["identifier"],
             "url": info["url"],
-
             "filename": info["filename"],
-
             "size": info["size"],
-
             "width": WIDTH,
-
             "height": HEIGHT,
-
             "fps": FPS
         })
 
     except Exception as e:
 
+        print("[Video] /video error:", e)
+
         return jsonify({
-
             "success": False,
-
             "error": str(e)
-
         }), 500
 
 
@@ -294,14 +305,12 @@ def frame():
     )
 
     if not url:
-
         return jsonify({
             "success": False,
             "error": "Missing url"
         }), 400
 
     if "archive.org/details/" not in url:
-
         return jsonify({
             "success": False,
             "error": "Only Internet Archive URLs are supported"
@@ -309,12 +318,7 @@ def frame():
 
     try:
 
-        frame_number = int(
-            frame_number
-        )
-
-        if frame_number < 0:
-            frame_number = 0
+        frame_number = int(frame_number)
 
     except ValueError:
 
@@ -323,35 +327,25 @@ def frame():
             "error": "Invalid frame number"
         }), 400
 
+    if frame_number < 0:
+        frame_number = 0
+
     try:
 
-        info = get_video(
-            url
-        )
+        info = get_video(url)
 
         png_data = extract_frame(
             info["path"],
             frame_number
         )
 
-        encoded = base64.b64encode(
-            png_data
-        ).decode("ascii")
-
-        return jsonify({
-
-            "success": True,
-
-            "frame": frame_number,
-
-            "width": WIDTH,
-
-            "height": HEIGHT,
-
-            "format": "png",
-
-            "data": encoded
-        })
+        return Response(
+            png_data,
+            mimetype="image/png",
+            headers={
+                "Cache-Control": "public, max-age=31536000"
+            }
+        )
 
     except Exception as e:
 
@@ -361,11 +355,47 @@ def frame():
         )
 
         return jsonify({
-
             "success": False,
-
             "error": str(e)
+        }), 500
 
+
+@app.route("/info")
+def info():
+
+    url = request.args.get("url")
+
+    if not url:
+        return jsonify({
+            "success": False,
+            "error": "Missing url"
+        }), 400
+
+    if "archive.org/details/" not in url:
+        return jsonify({
+            "success": False,
+            "error": "Only Internet Archive URLs are supported"
+        }), 400
+
+    try:
+
+        video_info = get_archive_video(url)
+
+        return jsonify({
+            "success": True,
+            "identifier": video_info["identifier"],
+            "filename": video_info["filename"],
+            "size": video_info["size"],
+            "width": WIDTH,
+            "height": HEIGHT,
+            "fps": FPS
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
         }), 500
 
 
