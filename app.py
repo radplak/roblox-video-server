@@ -14,12 +14,12 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG
+# CONFIG (OPTIMIZED FOR STABLE STREAMING)
 # ============================================================
 
-OUTPUT_WIDTH = 426
-OUTPUT_HEIGHT = 240
-TARGET_FPS = 30
+OUTPUT_WIDTH = 320
+OUTPUT_HEIGHT = 180
+TARGET_FPS = 24
 FRAME_SIZE = OUTPUT_WIDTH * OUTPUT_HEIGHT * 4  # RGBA
 
 REQUEST_TIMEOUT = 60
@@ -29,7 +29,7 @@ CACHE_ROOT = "/tmp/video_cache"
 VIDEO_DIR = os.path.join(CACHE_ROOT, "source")
 FRAME_DIR = os.path.join(CACHE_ROOT, "frames")
 
-MAX_BATCH = 30          # Increased batch size (1 second of video)
+MAX_BATCH = 48          # Larger batch sizes for continuous delivery
 FRAME_WAIT_TIMEOUT = 5.0
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
@@ -237,7 +237,7 @@ class ExtractionJob:
                 with self.lock:
                     self.ready = index
 
-                if index - rate_check_index >= 30:
+                if index - rate_check_index >= 24:
                     elapsed = time.time() - rate_check_start
                     actual_fps = (index - rate_check_index) / elapsed if elapsed > 0 else 0
                     log(f"Extraction: {actual_fps:.1f} fps - frame {index}")
@@ -328,7 +328,7 @@ def frames():
 
     try:
         start_frame = max(0, int(request.args.get("start", "0")))
-        count = max(1, min(int(request.args.get("count", "30")), MAX_BATCH))
+        count = max(1, min(int(request.args.get("count", "48")), MAX_BATCH))
     except ValueError:
         return jsonify({"success": False, "error": "Invalid frame parameters."}), 400
 
