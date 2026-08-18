@@ -1,6 +1,8 @@
 services:
   - type: web
     name: roblox-internet-archive-video
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    plan: free
