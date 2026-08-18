@@ -29,7 +29,11 @@ def video():
             "error": "Only Internet Archive URLs are supported"
         }), 400
 
-    identifier = url.split("/details/", 1)[1].split("?", 1)[0].split("#", 1)[0]
+    identifier = (
+        url.split("/details/", 1)[1]
+        .split("?", 1)[0]
+        .split("#", 1)[0]
+    )
 
     try:
         response = requests.get(
@@ -47,7 +51,6 @@ def video():
         }), 500
 
     files = data.get("files", [])
-
     videos = []
 
     for file in files:
@@ -56,7 +59,7 @@ def video():
         if name.lower().endswith(".mp4"):
             try:
                 size = int(file.get("size", 0))
-            except:
+            except (TypeError, ValueError):
                 size = 0
 
             videos.append({
