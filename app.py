@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from urllib.parse import urlparse, parse_qs
+import yt_dlp
 
 app = Flask(__name__)
 
@@ -17,14 +18,10 @@ def test():
     })
 
 
-@app.route("/load", methods=["GET", "POST"])
+@app.route("/load")
 def load_video():
 
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        url = body.get("url", "")
-    else:
-        url = request.args.get("url", "")
+    url = request.args.get("url", "")
 
     if not url:
         return jsonify({
@@ -32,10 +29,9 @@ def load_video():
             "error": "No YouTube URL was provided."
         }), 400
 
-    # Extract YouTube video ID
-    video_id = None
-
     parsed = urlparse(url)
+
+    video_id = None
 
     if parsed.hostname in ("youtube.com", "www.youtube.com"):
         query = parse_qs(parsed.query)
@@ -50,11 +46,33 @@ def load_video():
             "error": "Invalid YouTube URL."
         }), 400
 
-    return jsonify({
-        "success": True,
-        "video_id": video_id,
-        "message": "YouTube URL received!"
-    })
+    try:
+
+        options = {
+            "quiet": True,
+            "skip_download": True,
+            "noplaylist": True,
+        }
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        return jsonify({
+            "success": True,
+            "video_id": video_id,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "fps": info.get("fps"),
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 
 if __name__ == "__main__":
