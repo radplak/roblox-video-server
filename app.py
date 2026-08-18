@@ -1,125 +1,116 @@
+```python
 from flask import Flask, request, jsonify
-from urllib.parse import urlparse, parse_qs
-import yt_dlp
-import os
-import shutil
-import tempfile
+import requests
+import re
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 
-SECRET_COOKIE_FILE = "/etc/secrets/cookies.txt"
+IA_METADATA = "https://archive.org/metadata/{}"
+
+
+def get_identifier(url):
+    parsed = urlparse(url)
+
+    if parsed.netloc not in ("archive.org", "www.archive.org"):
+        return None
+
+    match = re.match(r"^/details/([^/?#]+)", parsed.path)
+
+    if not match:
+        return None
+
+    return match.group(1)
 
 
 @app.route("/")
-def home():
-    return "Roblox Video Server is running!"
-
-
-@app.route("/test")
-def test():
-    file_exists = os.path.isfile(SECRET_COOKIE_FILE)
-
+def index():
     return jsonify({
         "success": True,
-        "message": "Roblox connected successfully!",
-        "file_exists": file_exists,
-        "file_size": os.path.getsize(SECRET_COOKIE_FILE)
-        if file_exists else 0
+        "message": "Internet Archive video server is running"
     })
 
 
-@app.route("/load")
-def load_video():
-
-    url = request.args.get("url", "")
+@app.route("/video")
+def video():
+    url = request.args.get("url")
 
     if not url:
         return jsonify({
             "success": False,
-            "error": "No YouTube URL was provided."
+            "error": "Missing url parameter"
         }), 400
 
-    parsed = urlparse(url)
+    identifier = get_identifier(url)
 
-    video_id = None
-
-    if parsed.hostname in ("youtube.com", "www.youtube.com"):
-        query = parse_qs(parsed.query)
-        video_id = query.get("v", [None])[0]
-
-    elif parsed.hostname == "youtu.be":
-        video_id = parsed.path.strip("/")
-
-    if not video_id:
+    if not identifier:
         return jsonify({
             "success": False,
-            "error": "Invalid YouTube URL."
+            "error": "Invalid Internet Archive URL"
         }), 400
-
-    temporary_cookie_file = None
 
     try:
+        response = requests.get(
+            IA_METADATA.format(identifier),
+            timeout=20
+        )
 
-        options = {
-            "quiet": True,
-            "skip_download": True,
-            "noplaylist": True,
-        }
-
-        # Copy the read-only Render Secret File
-        # into /tmp, which is writable.
-        if os.path.isfile(SECRET_COOKIE_FILE):
-
-            temporary_cookie_file = os.path.join(
-                tempfile.gettempdir(),
-                "youtube_cookies.txt"
-            )
-
-            shutil.copyfile(
-                SECRET_COOKIE_FILE,
-                temporary_cookie_file
-            )
-
-            options["cookiefile"] = temporary_cookie_file
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=False
-            )
-
-        return jsonify({
-            "success": True,
-            "video_id": video_id,
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "width": info.get("width"),
-            "height": info.get("height"),
-            "fps": info.get("fps")
-        })
+        response.raise_for_status()
+        metadata = response.json()
 
     except Exception as e:
-
         return jsonify({
             "success": False,
-            "error": str(e)
-        }), 500
+            "error": f"Unable to access Internet Archive: {str(e)}"
+        }), 502
 
-    finally:
+    files = metadata.get("files", [])
 
-        # Delete the temporary copy when we're finished.
-        if temporary_cookie_file and os.path.exists(
-            temporary_cookie_file
+    video_files = []
+
+    for file in files:
+        name = file.get("name", "")
+        fmt = str(file.get("format", "")).lower()
+
+        if (
+            fmt in ("mpeg4", "h.264", "mp4")
+            or name.lower().endswith(".mp4")
         ):
-            try:
-                os.remove(temporary_cookie_file)
-            except Exception:
-                pass
+            video_files.append(file)
+
+    if not video_files:
+        return jsonify({
+            "success": False,
+            "error": "No MP4 video was found for this item"
+        }), 404
+
+    # Prefer the largest MP4 available.
+    video_files.sort(
+        key=lambda x: int(x.get("size", 0) or 0),
+        reverse=True
+    )
+
+    selected = video_files[0]
+    filename = selected["name"]
+
+    direct_url = (
+        f"https://archive.org/download/"
+        f"{identifier}/{filename}"
+    )
+
+    return jsonify({
+        "success": True,
+        "identifier": identifier,
+        "filename": filename,
+        "url": direct_url,
+        "size": selected.get("size"),
+        "format": selected.get("format")
+    })
 
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=10000
+        port=5000
     )
+```
