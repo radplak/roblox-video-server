@@ -5,7 +5,6 @@ import threading
 import time
 from urllib.parse import urlparse, quote
 import subprocess
-import tempfile
 
 import numpy as np
 import requests
@@ -18,8 +17,8 @@ app = Flask(__name__)
 # CONFIG
 # ============================================================
 
-OUTPUT_WIDTH = 854
-OUTPUT_HEIGHT = 480
+OUTPUT_WIDTH = 426
+OUTPUT_HEIGHT = 240
 TARGET_FPS = 30
 FRAME_SIZE = OUTPUT_WIDTH * OUTPUT_HEIGHT * 4  # RGBA
 
@@ -30,8 +29,8 @@ CACHE_ROOT = "/tmp/video_cache"
 VIDEO_DIR = os.path.join(CACHE_ROOT, "source")
 FRAME_DIR = os.path.join(CACHE_ROOT, "frames")
 
-MAX_BATCH = 15          # frames per /frames response (compressed, so this is cheap now)
-FRAME_WAIT_TIMEOUT = 5.0  # seconds to wait for extraction to catch up before responding partial
+MAX_BATCH = 30          # Increased batch size (1 second of video)
+FRAME_WAIT_TIMEOUT = 5.0
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(FRAME_DIR, exist_ok=True)
@@ -73,10 +72,6 @@ def find_video_file(metadata):
     if not candidates:
         raise ValueError("No supported video file was found.")
 
-    # Prefer archive.org's own transcoded "*.ia.mp4" derivative when present:
-    # it's purpose-built for streaming, much smaller than raw uploads, and
-    # since we downscale to 480p anyway, source quality beyond that is wasted
-    # bandwidth. Falling back to raw originals only when no derivative exists.
     ia_derivatives = [f for f in candidates if f.get("name", "").lower().endswith(".ia.mp4")]
     if ia_derivatives:
         ia_derivatives.sort(key=lambda f: int(f.get("size", 0) or 0))
@@ -100,7 +95,7 @@ def resolve_video(archive_url):
 
 
 # ============================================================
-# SOURCE VIDEO CACHE (download once, reuse forever)
+# SOURCE VIDEO CACHE
 # ============================================================
 
 _download_locks = {}
@@ -115,7 +110,6 @@ def _lock_for(identifier):
 
 
 def get_cached_video_path(identifier, filename, download_url):
-    """Downloads the source video once per identifier and reuses it after that."""
     safe_name = identifier.replace("/", "_")
     dest_path = os.path.join(VIDEO_DIR, safe_name)
 
@@ -124,7 +118,6 @@ def get_cached_video_path(identifier, filename, download_url):
 
     lock = _lock_for(identifier)
     with lock:
-        # Re-check after acquiring the lock in case another thread just finished.
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
             return dest_path
 
@@ -169,14 +162,7 @@ def get_video_info(path):
 
 
 # ============================================================
-# DELTA + ZSTD "CODEC"
-#
-# Each frame is XORed against the previously decoded raw frame
-# (frame 0 is XORed against all-zero), then compressed with Zstd
-# - the same (and only) algorithm Roblox's EncodingService can
-# decompress natively via EncodingService:DecompressBuffer(). Both
-# ends do the heavy lifting in C, not interpreted Python/Luau loops,
-# which is what a real-time 30fps budget actually requires.
+# CODEC
 # ============================================================
 
 _zstd_compressor = zstd.ZstdCompressor(level=3)
@@ -187,7 +173,7 @@ def encode_frame_payload(delta_bytes: bytes) -> bytes:
 
 
 # ============================================================
-# BACKGROUND FRAME EXTRACTION (decode + compress once, cache to disk)
+# BACKGROUND FRAME EXTRACTION
 # ============================================================
 
 _jobs = {}
@@ -235,7 +221,6 @@ class ExtractionJob:
                 if len(raw) != FRAME_SIZE:
                     break
 
-                # Resume support: skip re-encoding frames already cached from a prior run.
                 out_path = self.frame_path(index)
                 current = np.frombuffer(raw, dtype=np.uint8)
 
@@ -255,10 +240,7 @@ class ExtractionJob:
                 if index - rate_check_index >= 30:
                     elapsed = time.time() - rate_check_start
                     actual_fps = (index - rate_check_index) / elapsed if elapsed > 0 else 0
-                    log(
-                        f"Extraction throughput: {actual_fps:.1f} fps "
-                        f"(target {TARGET_FPS} fps) - frame {index}"
-                    )
+                    log(f"Extraction: {actual_fps:.1f} fps - frame {index}")
                     rate_check_start = time.time()
                     rate_check_index = index
 
@@ -346,7 +328,7 @@ def frames():
 
     try:
         start_frame = max(0, int(request.args.get("start", "0")))
-        count = max(1, min(int(request.args.get("count", "5")), MAX_BATCH))
+        count = max(1, min(int(request.args.get("count", "30")), MAX_BATCH))
     except ValueError:
         return jsonify({"success": False, "error": "Invalid frame parameters."}), 400
 
@@ -356,7 +338,6 @@ def frames():
         source = get_video_info(video_path)
         job = get_or_start_job(identifier, video_path, source["duration"])
 
-        # Give extraction a chance to catch up to the requested range.
         deadline = time.time() + FRAME_WAIT_TIMEOUT
         while time.time() < deadline:
             with job.lock:
@@ -397,16 +378,6 @@ def frames():
     except Exception as e:
         log("Frame error:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"success": False, "error": "Endpoint not found."}), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({"success": False, "error": "Internal server error."}), 500
 
 
 if __name__ == "__main__":
