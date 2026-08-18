@@ -227,6 +227,8 @@ class ExtractionJob:
 
             previous = np.zeros(FRAME_SIZE, dtype=np.uint8)
             index = 0
+            rate_check_start = time.time()
+            rate_check_index = 0
 
             while True:
                 raw = process.stdout.read(FRAME_SIZE)
@@ -249,6 +251,16 @@ class ExtractionJob:
                 index += 1
                 with self.lock:
                     self.ready = index
+
+                if index - rate_check_index >= 30:
+                    elapsed = time.time() - rate_check_start
+                    actual_fps = (index - rate_check_index) / elapsed if elapsed > 0 else 0
+                    log(
+                        f"Extraction throughput: {actual_fps:.1f} fps "
+                        f"(target {TARGET_FPS} fps) - frame {index}"
+                    )
+                    rate_check_start = time.time()
+                    rate_check_index = index
 
             process.stdout.close()
             process.wait(timeout=5)
