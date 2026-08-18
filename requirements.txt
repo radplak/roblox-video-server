@@ -1,6 +1,6 @@
-Flask
+flask
 requests
-gunicorn
-imageio-ffmpeg
-numpy
 zstandard
+numpy
+scipy
+gunicorn
