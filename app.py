@@ -1,71 +1,36 @@
 import os
+import io
 import json
-import time
-import uuid
-import threading
+import base64
 import subprocess
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse, quote
 
 import requests
-import numpy as np
-import zstandard as zstd
-
-from flask import Flask, request, jsonify, Response
-
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-WIDTH = 854
-HEIGHT = 480
-
+OUTPUT_WIDTH = 854
+OUTPUT_HEIGHT = 480
 TARGET_FPS = 30
-
-FRAME_SIZE = WIDTH * HEIGHT * 4
-
-KEYFRAME_INTERVAL = 30
-
-# Maximum number of frames returned by one packet request.
-MAX_BATCH_FRAMES = 10
-
-# Try to keep an HTTP response below this size.
-MAX_RESPONSE_BYTES = 2_500_000
 
 REQUEST_TIMEOUT = 60
 
 ARCHIVE_HEADERS = {
-    "User-Agent": "RobloxVideoCodec/2.0"
+    "User-Agent": "RobloxVideoStreamer/1.0"
 }
 
-SESSION_TIMEOUT = 15 * 60
-
-
-# ============================================================
-# ZSTD
-# ============================================================
-
-ZSTD_LEVEL = 1
-
-ZSTD_COMPRESSOR = zstd.ZstdCompressor(
-    level=ZSTD_LEVEL
-)
-
+# Maximum number of frames encoded into one response.
+MAX_BATCH = 3
 
 # ============================================================
-# GLOBAL SESSIONS
-# ============================================================
-
-SESSIONS = {}
-
-SESSIONS_LOCK = threading.RLock()
-
-
-# ============================================================
-# LOGGING
+# LOG
 # ============================================================
 
 def log(*args):
@@ -73,7 +38,7 @@ def log(*args):
 
 
 # ============================================================
-# ARCHIVE
+# INTERNET ARCHIVE
 # ============================================================
 
 def get_archive_identifier(url):
@@ -105,7 +70,7 @@ def get_archive_identifier(url):
         return parts[1]
 
     raise ValueError(
-        "URL must be an Internet Archive /details/ or /download/ URL."
+        "URL must be an Internet Archive /details/ URL."
     )
 
 
@@ -116,10 +81,7 @@ def get_archive_metadata(identifier):
         + quote(identifier, safe="")
     )
 
-    log(
-        "Getting archive metadata:",
-        identifier
-    )
+    log("Getting metadata:", identifier)
 
     response = requests.get(
         url,
@@ -141,19 +103,13 @@ def get_archive_metadata(identifier):
 
 def find_video_file(metadata):
 
-    files = metadata.get(
-        "files",
-        []
-    )
+    files = metadata.get("files", [])
 
     candidates = []
 
     for item in files:
 
-        name = item.get(
-            "name",
-            ""
-        )
+        name = item.get("name", "")
 
         if not name:
             continue
@@ -168,42 +124,34 @@ def find_video_file(metadata):
 
         for item in files:
 
-            name = item.get(
-                "name",
-                ""
-            )
-
+            name = item.get("name", "")
             lower = name.lower()
 
-            if (
-                lower.endswith(".webm")
-                or lower.endswith(".mkv")
-                or lower.endswith(".mov")
-                or lower.endswith(".avi")
-            ):
+            if lower.endswith((
+                ".webm",
+                ".mkv",
+                ".mov",
+                ".avi"
+            )):
 
                 candidates.append(item)
 
     if not candidates:
 
         raise ValueError(
-            "No supported video file was found in this archive."
+            "No supported video file was found."
         )
 
     candidates.sort(
         key=lambda item: (
             0
-            if item.get(
-                "name",
-                ""
-            ).lower().endswith(".mp4")
+            if item.get("name", "")
+            .lower()
+            .endswith(".mp4")
             else 1,
 
             -int(
-                item.get(
-                    "size",
-                    0
-                )
+                item.get("size", 0)
                 or 0
             )
         )
@@ -219,23 +167,47 @@ def build_archive_download_url(
 
     return (
         "https://archive.org/download/"
-        + quote(
-            identifier,
-            safe=""
-        )
+        + quote(identifier, safe="")
         + "/"
-        + quote(
-            filename,
-            safe="/"
-        )
+        + quote(filename, safe="/")
     )
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_video(url, destination):
+
+    log("Downloading:", url)
+
+    with requests.get(
+        url,
+        headers=ARCHIVE_HEADERS,
+        timeout=REQUEST_TIMEOUT,
+        stream=True
+    ) as response:
+
+        response.raise_for_status()
+
+        with open(
+            destination,
+            "wb"
+        ) as output:
+
+            for chunk in response.iter_content(
+                chunk_size=1024 * 1024
+            ):
+
+                if chunk:
+                    output.write(chunk)
 
 
 # ============================================================
 # FFPROBE
 # ============================================================
 
-def run_ffprobe(video_url):
+def get_video_info(path):
 
     command = [
         "ffprobe",
@@ -247,43 +219,30 @@ def run_ffprobe(video_url):
         "v:0",
 
         "-show_entries",
-        "stream=width,height,r_frame_rate,avg_frame_rate,duration",
+        "stream=width,height,duration",
 
         "-of",
         "json",
 
-        video_url
+        path
     ]
 
     result = subprocess.run(
         command,
-
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-
-        text=True,
-
-        timeout=REQUEST_TIMEOUT
+        text=True
     )
 
     if result.returncode != 0:
 
         raise RuntimeError(
-            "ffprobe failed: "
-            + result.stderr
+            result.stderr
         )
 
-    try:
-
-        data = json.loads(
-            result.stdout
-        )
-
-    except Exception:
-
-        raise RuntimeError(
-            "ffprobe returned invalid JSON."
-        )
+    data = json.loads(
+        result.stdout
+    )
 
     streams = data.get(
         "streams",
@@ -298,515 +257,189 @@ def run_ffprobe(video_url):
 
     stream = streams[0]
 
-    source_width = int(
+    width = int(
         stream.get(
             "width",
             0
         )
     )
 
-    source_height = int(
+    height = int(
         stream.get(
             "height",
             0
         )
     )
 
-    if (
-        source_width <= 0
-        or source_height <= 0
-    ):
-
-        raise ValueError(
-            "Invalid source resolution."
-        )
-
-    fps_text = (
-        stream.get(
-            "avg_frame_rate"
-        )
-        or stream.get(
-            "r_frame_rate"
-        )
-        or "30/1"
-    )
-
-    try:
-
-        numerator, denominator = (
-            fps_text.split("/")
-        )
-
-        source_fps = (
-            float(numerator)
-            /
-            float(denominator)
-        )
-
-    except Exception:
-
-        source_fps = 30.0
-
     duration = stream.get(
         "duration"
     )
 
     try:
-
-        duration = float(
-            duration
-        )
-
+        duration = float(duration)
     except Exception:
-
         duration = None
 
     return {
-        "width": source_width,
-        "height": source_height,
-        "fps": source_fps,
+        "width": width,
+        "height": height,
         "duration": duration
     }
 
 
 # ============================================================
-# VIDEO SESSION
+# GET ARCHIVE VIDEO
 # ============================================================
 
-class VideoSession:
+def resolve_video(archive_url):
 
-    def __init__(
-        self,
-        session_id,
-        archive_url,
+    identifier = get_archive_identifier(
+        archive_url
+    )
+
+    metadata = get_archive_metadata(
+        identifier
+    )
+
+    video = find_video_file(
+        metadata
+    )
+
+    filename = video["name"]
+
+    download_url = build_archive_download_url(
+        identifier,
+        filename
+    )
+
+    return (
         identifier,
         filename,
-        video_url,
-        source
-    ):
-
-        self.id = session_id
-
-        self.archive_url = archive_url
-
-        self.identifier = identifier
-
-        self.filename = filename
-
-        self.video_url = video_url
-
-        self.source_width = source["width"]
-
-        self.source_height = source["height"]
-
-        self.source_fps = source["fps"]
-
-        self.duration = source["duration"]
-
-        self.width = WIDTH
-
-        self.height = HEIGHT
-
-        self.fps = TARGET_FPS
-
-        self.frame_number = 0
-
-        self.previous_frame = None
-
-        self.finished = False
-
-        self.created_at = time.time()
-
-        self.last_used = time.time()
-
-        self.lock = threading.RLock()
-
-        self.process = None
-
-        self.start_ffmpeg()
-
-    # --------------------------------------------------------
-    # FFmpeg
-    # --------------------------------------------------------
-
-    def start_ffmpeg(self):
-
-        scale_filter = (
-            f"scale={WIDTH}:{HEIGHT}:"
-            "force_original_aspect_ratio=decrease,"
-            f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            "format=rgba"
-        )
-
-        command = [
-
-            "ffmpeg",
-
-            "-hide_banner",
-
-            "-loglevel",
-            "error",
-
-            "-nostdin",
-
-            "-reconnect",
-            "1",
-
-            "-reconnect_streamed",
-            "1",
-
-            "-reconnect_delay_max",
-            "5",
-
-            "-i",
-            self.video_url,
-
-            "-an",
-
-            "-vf",
-            scale_filter,
-
-            "-r",
-            str(TARGET_FPS),
-
-            "-fps_mode",
-            "cfr",
-
-            "-f",
-            "rawvideo",
-
-            "-pix_fmt",
-            "rgba",
-
-            "pipe:1"
-        ]
-
-        log(
-            "Starting FFmpeg session:",
-            self.id
-        )
-
-        self.process = subprocess.Popen(
-
-            command,
-
-            stdout=subprocess.PIPE,
-
-            stderr=subprocess.PIPE,
-
-            bufsize=1024 * 1024
-        )
-
-    # --------------------------------------------------------
-    # Read one frame
-    # --------------------------------------------------------
-
-    def read_frame(self):
-
-        if self.finished:
-            return None
-
-        if not self.process:
-            return None
-
-        raw = self.process.stdout.read(
-            FRAME_SIZE
-        )
-
-        if not raw:
-
-            self.finished = True
-
-            return None
-
-        if len(raw) != FRAME_SIZE:
-
-            log(
-                "Incomplete frame:",
-                len(raw),
-                "expected:",
-                FRAME_SIZE
-            )
-
-            self.finished = True
-
-            return None
-
-        return raw
-
-    # --------------------------------------------------------
-    # Encode one frame
-    # --------------------------------------------------------
-
-    def encode_frame(
-        self,
-        raw
-    ):
-
-        frame_number = self.frame_number
-
-        is_keyframe = (
-            frame_number == 0
-            or frame_number
-            % KEYFRAME_INTERVAL
-            == 0
-        )
-
-        current = np.frombuffer(
-            raw,
-            dtype=np.uint8
-        )
-
-        if (
-            is_keyframe
-            or self.previous_frame is None
-        ):
-
-            compressed = (
-                ZSTD_COMPRESSOR.compress(
-                    raw
-                )
-            )
-
-            packet_type = 1
-
-        else:
-
-            previous = np.frombuffer(
-                self.previous_frame,
-                dtype=np.uint8
-            )
-
-            delta = np.bitwise_xor(
-                current,
-                previous
-            )
-
-            compressed = (
-                ZSTD_COMPRESSOR.compress(
-                    delta.tobytes()
-                )
-            )
-
-            packet_type = 0
-
-        self.previous_frame = raw
-
-        self.frame_number += 1
-
-        return (
-            frame_number,
-            packet_type,
-            compressed
-        )
-
-    # --------------------------------------------------------
-    # Get packets
-    # --------------------------------------------------------
-
-    def get_packets(
-        self,
-        requested_start,
-        requested_count
-    ):
-
-        with self.lock:
-
-            self.last_used = time.time()
-
-            if requested_count <= 0:
-
-                return b"", False
-
-            requested_count = min(
-                requested_count,
-                MAX_BATCH_FRAMES
-            )
-
-            # The codec is sequential.
-            #
-            # We cannot seek backwards because delta frames
-            # depend on the previous frame.
-            #
-            # We also don't allow skipping ahead because
-            # that would destroy the delta chain.
-
-            if requested_start != self.frame_number:
-
-                raise ValueError(
-                    "Session frame mismatch. "
-                    f"Expected {self.frame_number}, "
-                    f"received {requested_start}."
-                )
-
-            packets = []
-
-            total_size = 0
-
-            for _ in range(
-                requested_count
-            ):
-
-                raw = self.read_frame()
-
-                if raw is None:
-                    break
-
-                (
-                    frame_number,
-                    packet_type,
-                    compressed
-                ) = self.encode_frame(
-                    raw
-                )
-
-                # Packet:
-                #
-                # 4 bytes frame number
-                # 1 byte type
-                # 4 bytes compressed size
-                # N bytes compressed data
-
-                packet = (
-                    frame_number.to_bytes(
-                        4,
-                        "little"
-                    )
-                    +
-                    bytes([
-                        packet_type
-                    ])
-                    +
-                    len(
-                        compressed
-                    ).to_bytes(
-                        4,
-                        "little"
-                    )
-                    +
-                    compressed
-                )
-
-                # Don't allow the response to grow
-                # excessively.
-
-                if (
-                    packets
-                    and
-                    total_size
-                    + len(packet)
-                    > MAX_RESPONSE_BYTES
-                ):
-
-                    # We already have at least one
-                    # frame, so stop here.
-
-                    # Rollback is not possible because
-                    # FFmpeg has already advanced.
-
-                    # Therefore we only use this protection
-                    # when the packet itself is too large.
-                    break
-
-                packets.append(
-                    packet
-                )
-
-                total_size += len(
-                    packet
-                )
-
-            if not packets:
-
-                return b"", self.finished
-
-            return (
-                b"".join(packets),
-                self.finished
-            )
-
-    # --------------------------------------------------------
-    # Stop
-    # --------------------------------------------------------
-
-    def stop(self):
-
-        with self.lock:
-
-            if self.process:
-
-                try:
-                    self.process.kill()
-
-                except Exception:
-                    pass
-
-                try:
-                    self.process.wait(
-                        timeout=2
-                    )
-
-                except Exception:
-                    pass
-
-                self.process = None
-
-            self.finished = True
+        download_url
+    )
 
 
 # ============================================================
-# SESSION CLEANUP
+# DECODE FRAMES
 # ============================================================
 
-def cleanup_sessions():
+def decode_frames(
+    video_path,
+    start_frame,
+    count
+):
 
-    while True:
+    start_time = (
+        start_frame / TARGET_FPS
+    )
 
-        time.sleep(60)
+    duration = (
+        count / TARGET_FPS
+    )
 
-        now = time.time()
+    vf = (
+        f"scale={OUTPUT_WIDTH}:"
+        f"{OUTPUT_HEIGHT}:"
+        "force_original_aspect_ratio=decrease,"
+        f"pad={OUTPUT_WIDTH}:"
+        f"{OUTPUT_HEIGHT}:"
+        "(ow-iw)/2:"
+        "(oh-ih)/2,"
+        "format=rgba"
+    )
 
-        expired = []
+    command = [
 
-        with SESSIONS_LOCK:
+        "ffmpeg",
 
-            for session_id, session in list(
-                SESSIONS.items()
-            ):
+        "-hide_banner",
+        "-loglevel",
+        "error",
 
-                if (
-                    now
-                    - session.last_used
-                    > SESSION_TIMEOUT
-                ):
+        "-ss",
+        str(start_time),
 
-                    expired.append(
-                        session_id
-                    )
+        "-i",
+        video_path,
 
-            for session_id in expired:
+        "-t",
+        str(duration),
 
-                session = SESSIONS.pop(
-                    session_id,
-                    None
-                )
+        "-vf",
+        vf,
 
-                if session:
+        "-r",
+        str(TARGET_FPS),
 
-                    log(
-                        "Cleaning session:",
-                        session_id
-                    )
+        "-frames:v",
+        str(count),
 
-                    session.stop()
+        "-f",
+        "rawvideo",
 
+        "-pix_fmt",
+        "rgba",
 
-cleanup_thread = threading.Thread(
-    target=cleanup_sessions,
-    daemon=True
-)
+        "pipe:1"
+    ]
 
-cleanup_thread.start()
+    log(
+        "Decoding:",
+        "start =", start_frame,
+        "count =", count
+    )
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    frame_size = (
+        OUTPUT_WIDTH
+        * OUTPUT_HEIGHT
+        * 4
+    )
+
+    frames = []
+
+    try:
+
+        for _ in range(count):
+
+            raw = process.stdout.read(
+                frame_size
+            )
+
+            if len(raw) != frame_size:
+                break
+
+            frames.append(
+                base64.b64encode(
+                    raw
+                ).decode("ascii")
+            )
+
+    finally:
+
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
+
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+        try:
+            process.wait(
+                timeout=2
+            )
+        except Exception:
+            pass
+
+    return frames
 
 
 # ============================================================
@@ -817,26 +450,11 @@ cleanup_thread.start()
 def index():
 
     return jsonify({
-
         "status": "ok",
-
-        "service":
-            "Roblox Video Codec",
-
-        "codec":
-            "ZSTD-XOR-RGBA",
-
-        "width":
-            WIDTH,
-
-        "height":
-            HEIGHT,
-
-        "fps":
-            TARGET_FPS,
-
-        "keyframeInterval":
-            KEYFRAME_INTERVAL
+        "service": "Roblox Video Server",
+        "resolution": "854x480",
+        "fps": TARGET_FPS,
+        "codec": "RGBA"
     })
 
 
@@ -853,123 +471,74 @@ def health():
 
 
 # ============================================================
-# START VIDEO
+# VIDEO INFO
 # ============================================================
 
-@app.route(
-    "/video/start",
-    methods=["POST"]
-)
-def video_start():
+@app.route("/video", methods=["GET"])
+def video_info():
+
+    archive_url = request.args.get(
+        "url"
+    )
+
+    if not archive_url:
+
+        return jsonify({
+            "success": False,
+            "error": "Missing URL."
+        }), 400
 
     try:
 
-        data = request.get_json(
-            silent=True
-        ) or {}
-
-        archive_url = data.get(
-            "url"
-        )
-
-        if not archive_url:
-
-            return jsonify({
-                "success": False,
-                "error": "Missing URL."
-            }), 400
-
-        if not isinstance(
-            archive_url,
-            str
-        ):
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "URL must be a string."
-            }), 400
-
-        archive_url = archive_url.strip()
-
-        identifier = get_archive_identifier(
+        (
+            identifier,
+            filename,
+            download_url
+        ) = resolve_video(
             archive_url
         )
 
-        metadata = get_archive_metadata(
-            identifier
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
 
-        video = find_video_file(
-            metadata
-        )
+            temporary_path = os.path.join(
+                temp_dir,
+                "source_video"
+            )
 
-        filename = video["name"]
+            download_video(
+                download_url,
+                temporary_path
+            )
 
-        video_url = build_archive_download_url(
-            identifier,
+            source = get_video_info(
+                temporary_path
+            )
+
+        log(
+            "Video:",
             filename
         )
 
         log(
-            "Probing:",
-            filename
-        )
-
-        source = run_ffprobe(
-            video_url
-        )
-
-        session_id = uuid.uuid4().hex
-
-        session = VideoSession(
-
-            session_id,
-
-            archive_url,
-
-            identifier,
-
-            filename,
-
-            video_url,
-
-            source
-        )
-
-        with SESSIONS_LOCK:
-
-            SESSIONS[
-                session_id
-            ] = session
-
-        log(
-            "Started:",
-            filename,
-
-            "| source:",
+            "Source:",
             source["width"],
             "x",
-            source["height"],
+            source["height"]
+        )
 
-            "| output:",
-            WIDTH,
+        log(
+            "Output:",
+            OUTPUT_WIDTH,
             "x",
-            HEIGHT,
-
-            "| FPS:",
-            TARGET_FPS,
-
-            "| session:",
-            session_id
+            OUTPUT_HEIGHT
         )
 
         return jsonify({
 
             "success": True,
 
-            "session":
-                session_id,
+            "identifier":
+                identifier,
 
             "filename":
                 filename,
@@ -980,79 +549,57 @@ def video_start():
             "sourceHeight":
                 source["height"],
 
-            "sourceFPS":
-                source["fps"],
-
-            "duration":
-                source["duration"],
-
             "width":
-                WIDTH,
+                OUTPUT_WIDTH,
 
             "height":
-                HEIGHT,
+                OUTPUT_HEIGHT,
 
             "fps":
                 TARGET_FPS,
 
             "codec":
-                "ZSTD-XOR-RGBA",
+                "RGBA",
 
-            "keyframeInterval":
-                KEYFRAME_INTERVAL
+            "scaled":
+                True
+
         })
-
-    except subprocess.TimeoutExpired:
-
-        return jsonify({
-
-            "success": False,
-
-            "error":
-                "FFprobe timed out."
-        }), 504
 
     except Exception as e:
 
         log(
-            "Start error:",
+            "Video info error:",
             repr(e)
         )
 
         return jsonify({
-
             "success": False,
-
-            "error":
-                str(e)
+            "error": str(e)
         }), 500
 
 
 # ============================================================
-# PACKETS
+# FRAME BATCH
 # ============================================================
 
-@app.route(
-    "/video/packets",
-    methods=["GET"]
-)
-def video_packets():
+@app.route("/frames", methods=["GET"])
+def frames():
 
-    session_id = request.args.get(
-        "session"
+    archive_url = request.args.get(
+        "url"
     )
 
-    if not session_id:
+    if not archive_url:
 
         return jsonify({
             "success": False,
-            "error":
-                "Missing session."
+            "error": "Missing URL."
         }), 400
 
     try:
 
-        start = int(
+        start_frame = int(
             request.args.get(
                 "start",
                 "0"
@@ -1062,7 +609,7 @@ def video_packets():
         count = int(
             request.args.get(
                 "count",
-                "10"
+                "3"
             )
         )
 
@@ -1070,128 +617,100 @@ def video_packets():
 
         return jsonify({
             "success": False,
-            "error":
-                "Invalid start/count."
+            "error": "Invalid frame parameters."
         }), 400
 
-    with SESSIONS_LOCK:
+    start_frame = max(
+        0,
+        start_frame
+    )
 
-        session = SESSIONS.get(
-            session_id
+    count = max(
+        1,
+        min(
+            count,
+            MAX_BATCH
         )
-
-    if not session:
-
-        return jsonify({
-            "success": False,
-            "error":
-                "Video session not found."
-        }), 404
+    )
 
     try:
 
-        payload, finished = (
-            session.get_packets(
-                start,
+        (
+            identifier,
+            filename,
+            download_url
+        ) = resolve_video(
+            archive_url
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+
+            temporary_path = os.path.join(
+                temp_dir,
+                "source_video"
+            )
+
+            download_video(
+                download_url,
+                temporary_path
+            )
+
+            raw_frames = decode_frames(
+                temporary_path,
+                start_frame,
                 count
             )
-        )
 
-        return Response(
+        result_frames = []
 
-            payload,
+        for index, data in enumerate(
+            raw_frames
+        ):
 
-            mimetype=
-                "application/octet-stream",
+            result_frames.append({
 
-            headers={
+                "frame":
+                    start_frame + index,
 
-                "Cache-Control":
-                    "no-store",
+                "data":
+                    data
 
-                "X-Video-Width":
-                    str(WIDTH),
-
-                "X-Video-Height":
-                    str(HEIGHT),
-
-                "X-Video-FPS":
-                    str(TARGET_FPS),
-
-                "X-Video-Finished":
-                    "1"
-                    if finished
-                    else "0"
-            }
-        )
-
-    except Exception as e:
+            })
 
         log(
-            "Packet error:",
-            repr(e)
+            "Returning",
+            len(result_frames),
+            "frames"
         )
 
         return jsonify({
 
-            "success": False,
+            "success": True,
 
-            "error":
-                str(e)
-        }), 500
+            "width":
+                OUTPUT_WIDTH,
 
+            "height":
+                OUTPUT_HEIGHT,
 
-# ============================================================
-# STOP
-# ============================================================
+            "fps":
+                TARGET_FPS,
 
-@app.route(
-    "/video/stop",
-    methods=["POST"]
-)
-def video_stop():
+            "frames":
+                result_frames
 
-    try:
-
-        data = request.get_json(
-            silent=True
-        ) or {}
-
-        session_id = data.get(
-            "session"
-        )
-
-        if not session_id:
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Missing session."
-            }), 400
-
-        with SESSIONS_LOCK:
-
-            session = SESSIONS.pop(
-                session_id,
-                None
-            )
-
-        if session:
-
-            session.stop()
-
-        return jsonify({
-            "success": True
         })
 
     except Exception as e:
 
+        log(
+            "Frame error:",
+            repr(e)
+        )
+
         return jsonify({
-
             "success": False,
-
-            "error":
-                str(e)
+            "error": str(e)
         }), 500
 
 
@@ -1203,11 +722,8 @@ def video_stop():
 def not_found(error):
 
     return jsonify({
-
         "success": False,
-
-        "error":
-            "Endpoint not found."
+        "error": "Endpoint not found."
     }), 404
 
 
@@ -1215,16 +731,13 @@ def not_found(error):
 def internal_error(error):
 
     return jsonify({
-
         "success": False,
-
-        "error":
-            "Internal server error."
+        "error": "Internal server error."
     }), 500
 
 
 # ============================================================
-# LOCAL TEST
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
@@ -1242,10 +755,7 @@ if __name__ == "__main__":
     )
 
     app.run(
-
         host="0.0.0.0",
-
         port=port,
-
         threaded=True
     )
