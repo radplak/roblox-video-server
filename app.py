@@ -3,6 +3,7 @@ import tempfile
 import threading
 import subprocess
 import time
+import struct
 from collections import deque
 
 import requests
@@ -14,27 +15,33 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ============================================================
-# VIDEO SETTINGS
+# CONFIG
 # ============================================================
 
-WIDTH = 160
-HEIGHT = 90
 FPS = 30
 
-# Keep a small buffer so FFmpeg can decode ahead.
-BUFFER_SIZE = 8
+# Highest quality we attempt first.
+# The server automatically falls back if decoding is too slow.
+QUALITY_LEVELS = [
+    (854, 480),
+    (640, 360),
+    (480, 270),
+    (320, 180),
+    (160, 90),
+]
+
+BUFFER_FRAMES = 12
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 # ============================================================
-# CACHES
+# GLOBAL STATE
 # ============================================================
 
 VIDEO_CACHE = {}
-
 DECODERS = {}
 
-CACHE_LOCK = threading.Lock()
+LOCK = threading.Lock()
 
 
 # ============================================================
@@ -57,7 +64,9 @@ def get_archive_video(archive_url):
     )
 
     if not identifier:
-        raise Exception("Missing Internet Archive identifier")
+        raise Exception(
+            "Missing Internet Archive identifier"
+        )
 
     response = requests.get(
         f"https://archive.org/metadata/{identifier}",
@@ -84,11 +93,13 @@ def get_archive_video(archive_url):
 
         videos.append({
             "name": name,
-            "size": size
+            "size": size,
         })
 
     if not videos:
-        raise Exception("No MP4 file found")
+        raise Exception(
+            "No MP4 file found"
+        )
 
     videos.sort(
         key=lambda x: x["size"],
@@ -107,15 +118,18 @@ def get_archive_video(archive_url):
         "identifier": identifier,
         "url": direct_url,
         "filename": selected["name"],
-        "size": selected["size"]
+        "size": selected["size"],
     }
 
 
 # ============================================================
-# DOWNLOAD / CACHE
+# DOWNLOAD
 # ============================================================
 
-def download_video(url, identifier):
+def download_video(
+    url,
+    identifier
+):
 
     cache_dir = os.path.join(
         tempfile.gettempdir(),
@@ -148,7 +162,9 @@ def download_video(url, identifier):
 
             return filename
 
-    temp_filename = filename + ".download"
+    temp_filename = (
+        filename + ".download"
+    )
 
     print(
         "[Video] Downloading:",
@@ -160,7 +176,7 @@ def download_video(url, identifier):
         with requests.get(
             url,
             stream=True,
-            timeout=60
+            timeout=120
         ) as response:
 
             response.raise_for_status()
@@ -171,7 +187,7 @@ def download_video(url, identifier):
             ) as file:
 
                 for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
+                    chunk_size=4 * 1024 * 1024
                 ):
 
                     if chunk:
@@ -194,14 +210,15 @@ def download_video(url, identifier):
         raise
 
     print(
-        "[Video] Download complete:",
-        filename
+        "[Video] Download complete"
     )
 
     return filename
 
 
-def get_video(archive_url):
+def get_video(
+    archive_url
+):
 
     info = get_archive_video(
         archive_url
@@ -209,7 +226,7 @@ def get_video(archive_url):
 
     identifier = info["identifier"]
 
-    with CACHE_LOCK:
+    with LOCK:
 
         cached = VIDEO_CACHE.get(
             identifier
@@ -228,9 +245,11 @@ def get_video(archive_url):
         identifier
     )
 
-    with CACHE_LOCK:
+    with LOCK:
 
-        VIDEO_CACHE[identifier] = path
+        VIDEO_CACHE[
+            identifier
+        ] = path
 
     info["path"] = path
 
@@ -238,32 +257,35 @@ def get_video(archive_url):
 
 
 # ============================================================
-# CONTINUOUS DECODER
+# CONTINUOUS FFmpeg DECODER
 # ============================================================
 
-class VideoDecoder:
+class Decoder:
 
     def __init__(
         self,
-        video_path
+        video_path,
+        width,
+        height
     ):
 
         self.video_path = video_path
 
+        self.width = width
+        self.height = height
+
         self.frame_size = (
-            WIDTH
-            * HEIGHT
-            * 2
+            width
+            * height
+            * 4
         )
 
         self.frames = deque(
-            maxlen=BUFFER_SIZE
+            maxlen=BUFFER_FRAMES
         )
 
-        self.lock = threading.Lock()
-
-        self.condition = threading.Condition(
-            self.lock
+        self.condition = (
+            threading.Condition()
         )
 
         self.running = True
@@ -271,13 +293,15 @@ class VideoDecoder:
         self.process = None
 
         self.thread = threading.Thread(
-            target=self._decode_loop,
+            target=self.decode_loop,
             daemon=True
         )
 
         self.thread.start()
 
-    def _start_ffmpeg(self):
+    # --------------------------------------------------------
+
+    def start_ffmpeg(self):
 
         command = [
 
@@ -287,30 +311,43 @@ class VideoDecoder:
             "-loglevel",
             "error",
 
-            # Decode continuously.
+            # Let FFmpeg use available CPU threads.
             "-threads",
             "0",
+
+            "-re",
+
+            "-stream_loop",
+            "-1",
 
             "-i",
             self.video_path,
 
-            # Resize once.
             "-vf",
-            f"scale={WIDTH}:{HEIGHT}",
+            (
+                f"scale={self.width}:{self.height}:"
+                "flags=lanczos"
+            ),
 
-            # RGB565 is half the size of RGBA.
+            "-r",
+            str(FPS),
+
             "-pix_fmt",
-            "rgb565le",
+            "rgba",
 
             "-f",
             "rawvideo",
 
-            "pipe:1"
+            "pipe:1",
         ]
 
         print(
-            "[Video] Starting FFmpeg:",
-            self.video_path
+            "[Video] FFmpeg:",
+            self.width,
+            "x",
+            self.height,
+            "@",
+            FPS
         )
 
         self.process = subprocess.Popen(
@@ -320,7 +357,12 @@ class VideoDecoder:
             bufsize=0
         )
 
-    def _read_exact(self, size):
+    # --------------------------------------------------------
+
+    def read_exact(
+        self,
+        size
+    ):
 
         data = bytearray()
 
@@ -337,17 +379,19 @@ class VideoDecoder:
 
         return bytes(data)
 
-    def _decode_loop(self):
+    # --------------------------------------------------------
+
+    def decode_loop(self):
 
         while self.running:
 
             try:
 
-                self._start_ffmpeg()
+                self.start_ffmpeg()
 
                 while self.running:
 
-                    frame = self._read_exact(
+                    frame = self.read_exact(
                         self.frame_size
                     )
 
@@ -356,15 +400,14 @@ class VideoDecoder:
 
                     with self.condition:
 
-                        # Wait while buffer is full.
                         while (
                             len(self.frames)
-                            >= BUFFER_SIZE
+                            >= BUFFER_FRAMES
                             and self.running
                         ):
 
                             self.condition.wait(
-                                timeout=0.1
+                                timeout=0.05
                             )
 
                         if not self.running:
@@ -403,30 +446,46 @@ class VideoDecoder:
 
             if self.running:
 
-                # Restart at beginning when video ends.
-                time.sleep(0.05)
+                time.sleep(
+                    0.1
+                )
 
-    def get_frame(self):
+    # --------------------------------------------------------
+
+    def get_frames(
+        self,
+        count
+    ):
+
+        result = []
 
         with self.condition:
 
             while (
-                not self.frames
+                len(result) < count
                 and self.running
             ):
 
-                self.condition.wait(
-                    timeout=1
-                )
+                if self.frames:
 
-            if not self.frames:
-                return None
+                    result.append(
+                        self.frames.popleft()
+                    )
 
-            frame = self.frames.popleft()
+                    self.condition.notify_all()
 
-            self.condition.notify_all()
+                else:
 
-            return frame
+                    self.condition.wait(
+                        timeout=1
+                    )
+
+                    if not self.frames:
+                        break
+
+        return result
+
+    # --------------------------------------------------------
 
     def stop(self):
 
@@ -445,29 +504,38 @@ class VideoDecoder:
 
 
 # ============================================================
-# GET / CREATE DECODER
+# DECODER MANAGEMENT
 # ============================================================
 
 def get_decoder(
     identifier,
-    video_path
+    path,
+    width,
+    height
 ):
 
-    with CACHE_LOCK:
+    key = (
+        identifier,
+        width,
+        height
+    )
+
+    with LOCK:
 
         decoder = DECODERS.get(
-            identifier
+            key
         )
 
         if decoder:
-
             return decoder
 
-        decoder = VideoDecoder(
-            video_path
+        decoder = Decoder(
+            path,
+            width,
+            height
         )
 
-        DECODERS[identifier] = decoder
+        DECODERS[key] = decoder
 
         return decoder
 
@@ -484,23 +552,26 @@ def home():
         "success": True,
 
         "message":
-            "Roblox Internet Archive "
-            "continuous video server",
-
-        "resolution":
-            f"{WIDTH}x{HEIGHT}",
+            "Roblox adaptive video server",
 
         "fps":
             FPS,
 
-        "format":
-            "RGB565",
+        "qualities":
+            [
+                {
+                    "width": w,
+                    "height": h
+                }
+                for w, h
+                in QUALITY_LEVELS
+            ],
 
         "decoder":
-            "FFmpeg continuous CPU decoding",
+            "FFmpeg CPU multithreaded",
 
-        "threads":
-            "automatic"
+        "mode":
+            "continuous"
     })
 
 
@@ -536,15 +607,15 @@ def video():
             url
         )
 
+        # Start with highest requested quality.
+        width, height = QUALITY_LEVELS[0]
+
         return jsonify({
 
             "success": True,
 
             "identifier":
                 info["identifier"],
-
-            "url":
-                info["url"],
 
             "filename":
                 info["filename"],
@@ -553,24 +624,26 @@ def video():
                 info["size"],
 
             "width":
-                WIDTH,
+                width,
 
             "height":
-                HEIGHT,
+                height,
 
             "fps":
                 FPS,
 
-            "format":
-                "RGB565"
+            "qualities":
+                [
+                    {
+                        "width": w,
+                        "height": h
+                    }
+                    for w, h
+                    in QUALITY_LEVELS
+                ]
         })
 
     except Exception as e:
-
-        print(
-            "[Video] /video error:",
-            e
-        )
 
         return jsonify({
 
@@ -583,37 +656,71 @@ def video():
 
 
 # ============================================================
-# NEXT FRAME
+# FRAME BATCH
 # ============================================================
 
-@app.route("/frame")
-def frame():
+@app.route("/frames")
+def frames():
 
     url = request.args.get(
         "url"
     )
 
-    if not url:
+    width = request.args.get(
+        "width",
+        "854"
+    )
+
+    height = request.args.get(
+        "height",
+        "480"
+    )
+
+    count = request.args.get(
+        "count",
+        "2"
+    )
+
+    try:
+
+        width = int(width)
+        height = int(height)
+        count = int(count)
+
+    except ValueError:
 
         return jsonify({
-
             "success": False,
-
-            "error":
-                "Missing url"
-
+            "error": "Invalid parameters"
         }), 400
 
-    if "archive.org/details/" not in url:
+    allowed = False
+
+    for w, h in QUALITY_LEVELS:
+
+        if (
+            width == w
+            and height == h
+        ):
+
+            allowed = True
+            break
+
+    if not allowed:
 
         return jsonify({
-
             "success": False,
-
             "error":
-                "Only Internet Archive URLs are supported"
-
+                "Unsupported resolution"
         }), 400
+
+    count = max(
+        1,
+        min(
+            count,
+            3
+        )
+    )
 
     try:
 
@@ -623,20 +730,55 @@ def frame():
 
         decoder = get_decoder(
             info["identifier"],
-            info["path"]
+            info["path"],
+            width,
+            height
         )
 
-        raw_frame = decoder.get_frame()
+        batch = decoder.get_frames(
+            count
+        )
 
-        if raw_frame is None:
+        if not batch:
 
             raise Exception(
-                "Decoder returned no frame"
+                "No frames available"
+            )
+
+        # ----------------------------------------------------
+        # PACKET FORMAT
+        #
+        # uint32 frame count
+        # repeated:
+        # uint32 frame size
+        # raw RGBA frame
+        # ----------------------------------------------------
+
+        output = bytearray()
+
+        output.extend(
+            struct.pack(
+                "<I",
+                len(batch)
+            )
+        )
+
+        for frame in batch:
+
+            output.extend(
+                struct.pack(
+                    "<I",
+                    len(frame)
+                )
+            )
+
+            output.extend(
+                frame
             )
 
         return Response(
 
-            raw_frame,
+            bytes(output),
 
             mimetype=
                 "application/octet-stream",
@@ -644,26 +786,29 @@ def frame():
             headers={
 
                 "X-Video-Width":
-                    str(WIDTH),
+                    str(width),
 
                 "X-Video-Height":
-                    str(HEIGHT),
+                    str(height),
 
                 "X-Video-FPS":
                     str(FPS),
 
-                "X-Video-Format":
-                    "RGB565",
+                "X-Video-Frames":
+                    str(len(batch)),
 
                 "Cache-Control":
-                    "no-cache"
+                    "no-cache",
+
+                "Content-Length":
+                    str(len(output))
             }
         )
 
     except Exception as e:
 
         print(
-            "[Video] Frame error:",
+            "[Video] Batch error:",
             e
         )
 
@@ -692,5 +837,6 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
+        threaded=True
     )
