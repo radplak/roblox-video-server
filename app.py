@@ -4,6 +4,7 @@ import tempfile
 import threading
 import subprocess
 import traceback
+import time
 
 import requests
 import imageio_ffmpeg
@@ -966,8 +967,7 @@ def frames():
                 packet
             )
 
-        elapsed =
-            time.time() - start
+        elapsed = time.time() - start
 
         print(
             "[RBC1] Batch:",
