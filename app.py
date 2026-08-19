@@ -24,7 +24,7 @@ OUTPUT_HEIGHT = 180
 TARGET_FPS = 24
 FRAME_SIZE = OUTPUT_WIDTH * OUTPUT_HEIGHT * 4  # RGBA
 
-NUM_AUDIO_CHANNELS = 4  # Number of dominant sine wave frequencies to extract
+NUM_AUDIO_CHANNELS = 4
 AUDIO_SAMPLE_RATE = 22050
 
 REQUEST_TIMEOUT = 60
@@ -34,33 +34,36 @@ CACHE_ROOT = "/tmp/video_cache"
 VIDEO_DIR = os.path.join(CACHE_ROOT, "source")
 FRAME_DIR = os.path.join(CACHE_ROOT, "frames")
 
-MAX_BATCH = 48          # Larger batch sizes for continuous delivery
+MAX_BATCH = 48
 FRAME_WAIT_TIMEOUT = 5.0
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(FRAME_DIR, exist_ok=True)
 
 
 def log(*args):
-    print("[Video]", *args, flush=True)
+    print("[Media]", *args, flush=True)
+
+
+def is_image_path(path):
+    return path.lower().endswith(IMAGE_EXTENSIONS)
 
 
 # ============================================================
-# UNIFIED MEDIA RESOLUTION (DISCORD + INTERNET ARCHIVE + DIRECT)
+# UNIFIED MEDIA RESOLUTION
 # ============================================================
 
 def is_direct_media_url(url):
-    """Checks if the URL is a direct media attachment (e.g. Discord, raw MP4, PNG, JPG)."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     path = parsed.path.lower()
     
-    # Check for Discord CDN domains
     if "discordapp.com" in domain or "discordapp.net" in domain or "discord.com" in domain:
         return True
         
-    # Check for raw video and image extensions
-    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi", ".png", ".jpg", ".jpeg", ".gif", ".webp")):
+    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif") + IMAGE_EXTENSIONS):
         return True
         
     return False
@@ -69,7 +72,7 @@ def is_direct_media_url(url):
 def get_archive_identifier(url):
     parsed = urlparse(url)
     if parsed.netloc.lower() not in ("archive.org", "www.archive.org"):
-        raise ValueError("Only Internet Archive and direct media URLs (e.g. Discord) are supported.")
+        raise ValueError("Only Internet Archive and direct media URLs are supported.")
     parts = [p for p in parsed.path.split("/") if p]
     if len(parts) < 2 or parts[0] not in ("details", "download"):
         raise ValueError("URL must be an Internet Archive /details/ URL.")
@@ -88,16 +91,9 @@ def get_archive_metadata(identifier):
 
 def find_video_file(metadata):
     files = metadata.get("files", [])
-    mp4s = [f for f in files if f.get("name", "").lower().endswith(".mp4")]
-    others = [f for f in files if f.get("name", "").lower().endswith((".webm", ".mkv", ".mov", ".avi"))]
-    candidates = mp4s or others
+    candidates = [f for f in files if f.get("name", "").lower().endswith((".mp4", ".webm", ".mkv", ".mov", ".avi"))]
     if not candidates:
         raise ValueError("No supported media file was found.")
-
-    ia_derivatives = [f for f in candidates if f.get("name", "").lower().endswith(".ia.mp4")]
-    if ia_derivatives:
-        ia_derivatives.sort(key=lambda f: int(f.get("size", 0) or 0))
-        return ia_derivatives[0]
 
     candidates.sort(key=lambda f: -int(f.get("size", 0) or 0))
     return candidates[0]
@@ -108,17 +104,12 @@ def build_archive_download_url(identifier, filename):
 
 
 def resolve_video(input_url):
-    """
-    Unified resolver: Returns (identifier, filename, download_url)
-    Works with Discord CDN URLs, raw media files, and Internet Archive URLs.
-    """
     input_url = input_url.strip()
     
     if is_direct_media_url(input_url):
-        # Generate a deterministic cache key from the URL path
         parsed = urlparse(input_url)
         clean_path = parsed.path
-        identifier = "discord_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
+        identifier = "direct_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
         
         filename = os.path.basename(unquote(clean_path)) or "media.mp4"
         download_url = input_url
@@ -159,7 +150,7 @@ def get_cached_video_path(identifier, filename, download_url):
         if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
             return dest_path
 
-        log("Downloading (first time only):", download_url)
+        log("Downloading media:", download_url)
         tmp_path = dest_path + ".part"
         with requests.get(download_url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT, stream=True) as r:
             r.raise_for_status()
@@ -168,51 +159,53 @@ def get_cached_video_path(identifier, filename, download_url):
                     if chunk:
                         out.write(chunk)
         os.replace(tmp_path, dest_path)
-        log("Downloaded:", dest_path)
+        log("Downloaded media:", dest_path)
 
     return dest_path
 
 
 def get_video_info(path):
+    is_img = is_image_path(path)
+    if is_img:
+        command = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json", path
+        ]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if not streams:
+            raise ValueError("Invalid image file.")
+        return {
+            "width": int(streams[0].get("width", 0)),
+            "height": int(streams[0].get("height", 0)),
+            "duration": 0.0,
+            "mediaType": "image"
+        }
+
     command = [
         "ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=width,height,duration",
         "-of", "json", path
     ]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        # Fallback for still image metadata if stream selection fails
-        command_img = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "stream=width,height",
-            "-of", "json", path
-        ]
-        result_img = subprocess.run(command_img, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result_img.returncode != 0:
-            raise RuntimeError(result.stderr)
-        data = json.loads(result_img.stdout)
-    else:
-        data = json.loads(result.stdout)
-
+    data = json.loads(result.stdout)
     streams = data.get("streams", [])
     if not streams:
-        raise ValueError("No video or image stream found.")
+        raise ValueError("No video stream found.")
     stream = streams[0]
-    duration = stream.get("duration")
-    try:
-        duration = float(duration)
-    except Exception:
-        duration = 0.0  # Default to 0 duration for static images
-
+    
     return {
         "width": int(stream.get("width", 0)),
         "height": int(stream.get("height", 0)),
-        "duration": duration,
+        "duration": float(stream.get("duration", 0.0)),
+        "mediaType": "video"
     }
 
 
 # ============================================================
-# CODEC & AUDIO EXTRACTION
+# CODEC & EXTRACTION
 # ============================================================
 
 _zstd_compressor = zstd.ZstdCompressor(level=3)
@@ -223,7 +216,6 @@ def encode_frame_payload(delta_bytes: bytes) -> bytes:
 
 
 def extract_full_audio_track(video_path, wav_path):
-    """Extracts 16-bit mono PCM audio from video using FFmpeg."""
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", video_path,
@@ -256,30 +248,26 @@ def get_audio_features_for_frame(audio_data, frame_index, samples_per_frame):
 
             audio_bytes.extend(struct.pack(">HB", freq, vol_byte))
     else:
-        # Silent audio payload for missing frames / static images
         audio_bytes.extend(b"\x00" * (NUM_AUDIO_CHANNELS * 3))
 
     return bytes(audio_bytes)
 
-
-# ============================================================
-# BACKGROUND FRAME EXTRACTION
-# ============================================================
 
 _jobs = {}
 _jobs_guard = threading.Lock()
 
 
 class ExtractionJob:
-    def __init__(self, identifier, video_path):
+    def __init__(self, identifier, video_path, is_image):
         self.identifier = identifier
         self.video_path = video_path
+        self.is_image = is_image
         self.frames_dir = os.path.join(FRAME_DIR, identifier.replace("/", "_"))
         os.makedirs(self.frames_dir, exist_ok=True)
         self.ready = 0
         self.done = False
         self.error = None
-        self.total_estimate = 0
+        self.total_estimate = 1 if is_image else 0
         self.lock = threading.Lock()
 
     def frame_path(self, index):
@@ -287,33 +275,36 @@ class ExtractionJob:
 
     def run(self):
         try:
-            # 1. Attempt audio extraction (silently ignored for static images)
-            wav_path = os.path.join(self.frames_dir, "audio.wav")
             audio_data = np.array([], dtype=np.int16)
             samples_per_frame = int(AUDIO_SAMPLE_RATE / TARGET_FPS)
 
-            try:
-                extract_full_audio_track(self.video_path, wav_path)
-                _, audio_data = wav.read(wav_path)
-            except Exception:
-                # Soundless media/image files skip audio processing
-                pass
+            if not self.is_image:
+                wav_path = os.path.join(self.frames_dir, "audio.wav")
+                try:
+                    extract_full_audio_track(self.video_path, wav_path)
+                    _, audio_data = wav.read(wav_path)
+                    if os.path.exists(wav_path):
+                        os.remove(wav_path)
+                except Exception:
+                    pass
 
-            # 2. Extract frame(s) using FFmpeg pipe
             vf = (
                 f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
                 f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=rgba"
             )
+            
             command = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-i", self.video_path,
                 "-vf", vf,
-                "-r", str(TARGET_FPS),
-                "-f", "rawvideo", "-pix_fmt", "rgba",
-                "pipe:1",
             ]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            if not self.is_image:
+                command.extend(["-r", str(TARGET_FPS)])
+                
+            command.extend(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
 
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             previous = np.zeros(FRAME_SIZE, dtype=np.uint8)
             index = 0
 
@@ -343,15 +334,15 @@ class ExtractionJob:
                 with self.lock:
                     self.ready = index
 
+                if self.is_image:
+                    break  # Images only need 1 frame
+
             process.stdout.close()
             process.wait(timeout=5)
 
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-
             with self.lock:
                 self.done = True
-            log("Extraction complete:", self.identifier, "-", index, "frames")
+            log("Processed:", self.identifier, f"({index} frames, image={self.is_image})")
 
         except Exception as e:
             log("Extraction failed:", self.identifier, repr(e))
@@ -360,13 +351,12 @@ class ExtractionJob:
                 self.done = True
 
 
-def get_or_start_job(identifier, video_path, duration_hint):
+def get_or_start_job(identifier, video_path, duration_hint, is_image):
     with _jobs_guard:
         job = _jobs.get(identifier)
         if job is None:
-            job = ExtractionJob(identifier, video_path)
-            # Estimate at least 1 frame for static pictures
-            job.total_estimate = max(1, int((duration_hint or 0) * TARGET_FPS))
+            job = ExtractionJob(identifier, video_path, is_image)
+            job.total_estimate = 1 if is_image else max(1, int((duration_hint or 0) * TARGET_FPS))
             _jobs[identifier] = job
             thread = threading.Thread(target=job.run, daemon=True)
             thread.start()
@@ -376,23 +366,6 @@ def get_or_start_job(identifier, video_path, duration_hint):
 # ============================================================
 # ROUTES
 # ============================================================
-
-@app.route("/")
-def index():
-    return jsonify({
-        "status": "ok",
-        "service": "Roblox Video & Image Server",
-        "resolution": f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
-        "fps": TARGET_FPS,
-        "audioChannels": NUM_AUDIO_CHANNELS,
-        "codec": "delta+zstd+sine_audio",
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "healthy"})
-
 
 @app.route("/video", methods=["GET"])
 def video_info():
@@ -404,24 +377,27 @@ def video_info():
         identifier, filename, download_url = resolve_video(archive_url)
         video_path = get_cached_video_path(identifier, filename, download_url)
         source = get_video_info(video_path)
-        job = get_or_start_job(identifier, video_path, source["duration"])
+        is_image = (source["mediaType"] == "image")
+        
+        job = get_or_start_job(identifier, video_path, source["duration"], is_image)
 
         return jsonify({
             "success": True,
+            "mediaType": source["mediaType"], # "image" or "video"
             "identifier": identifier,
             "filename": filename,
             "sourceWidth": source["width"],
             "sourceHeight": source["height"],
             "width": OUTPUT_WIDTH,
             "height": OUTPUT_HEIGHT,
-            "fps": TARGET_FPS,
-            "audioChannels": NUM_AUDIO_CHANNELS,
+            "fps": 0 if is_image else TARGET_FPS,
+            "audioChannels": 0 if is_image else NUM_AUDIO_CHANNELS,
             "codec": "delta+zstd+sine_audio",
             "totalFramesEstimate": job.total_estimate,
         })
 
     except Exception as e:
-        log("Video info error:", repr(e))
+        log("Media info error:", repr(e))
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -441,7 +417,9 @@ def frames():
         identifier, filename, download_url = resolve_video(archive_url)
         video_path = get_cached_video_path(identifier, filename, download_url)
         source = get_video_info(video_path)
-        job = get_or_start_job(identifier, video_path, source["duration"])
+        is_image = (source["mediaType"] == "image")
+        
+        job = get_or_start_job(identifier, video_path, source["duration"], is_image)
 
         deadline = time.time() + FRAME_WAIT_TIMEOUT
         while time.time() < deadline:
@@ -475,8 +453,8 @@ def frames():
             "X-Frame-Count": str(sent),
             "X-Width": str(OUTPUT_WIDTH),
             "X-Height": str(OUTPUT_HEIGHT),
-            "X-Audio-Channels": str(NUM_AUDIO_CHANNELS),
-            "X-Complete": "1" if done else "0",
+            "X-Audio-Channels": "0" if is_image else str(NUM_AUDIO_CHANNELS),
+            "X-Complete": "1" if (done or is_image) else "0",
             "X-Frames-Ready": str(ready),
         }
         return Response(bytes(body), mimetype="application/octet-stream", headers=headers)
@@ -488,5 +466,5 @@ def frames():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    log("Starting server on port", port)
+    log("Starting media server on port", port)
     app.run(host="0.0.0.0", port=port, threaded=True)
