@@ -3,7 +3,8 @@ import json
 import struct
 import threading
 import time
-from urllib.parse import urlparse, quote
+import hashlib
+from urllib.parse import urlparse, quote, unquote
 import subprocess
 
 import numpy as np
@@ -27,7 +28,7 @@ NUM_AUDIO_CHANNELS = 4  # Number of dominant sine wave frequencies to extract
 AUDIO_SAMPLE_RATE = 22050
 
 REQUEST_TIMEOUT = 60
-ARCHIVE_HEADERS = {"User-Agent": "RobloxVideoStreamer/1.0"}
+DEFAULT_HEADERS = {"User-Agent": "RobloxVideoStreamer/1.0"}
 
 CACHE_ROOT = "/tmp/video_cache"
 VIDEO_DIR = os.path.join(CACHE_ROOT, "source")
@@ -45,13 +46,30 @@ def log(*args):
 
 
 # ============================================================
-# INTERNET ARCHIVE RESOLUTION
+# UNIFIED VIDEO RESOLUTION (DISCORD + INTERNET ARCHIVE + DIRECT)
 # ============================================================
+
+def is_direct_video_url(url):
+    """Checks if the URL is a direct video attachment (e.g. Discord, raw MP4/WebM/MOV)."""
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    path = parsed.path.lower()
+    
+    # Check for Discord CDN domains
+    if "discordapp.com" in domain or "discordapp.net" in domain or "discord.com" in domain:
+        return True
+        
+    # Check for raw video extensions
+    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi")):
+        return True
+        
+    return False
+
 
 def get_archive_identifier(url):
     parsed = urlparse(url)
     if parsed.netloc.lower() not in ("archive.org", "www.archive.org"):
-        raise ValueError("Only Internet Archive URLs are supported.")
+        raise ValueError("Only Internet Archive and direct video URLs (e.g. Discord) are supported.")
     parts = [p for p in parsed.path.split("/") if p]
     if len(parts) < 2 or parts[0] not in ("details", "download"):
         raise ValueError("URL must be an Internet Archive /details/ URL.")
@@ -60,7 +78,7 @@ def get_archive_identifier(url):
 
 def get_archive_metadata(identifier):
     url = "https://archive.org/metadata/" + quote(identifier, safe="")
-    response = requests.get(url, headers=ARCHIVE_HEADERS, timeout=REQUEST_TIMEOUT)
+    response = requests.get(url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     data = response.json()
     if data.get("is_dark"):
@@ -89,8 +107,26 @@ def build_archive_download_url(identifier, filename):
     return "https://archive.org/download/" + quote(identifier, safe="") + "/" + quote(filename, safe="/")
 
 
-def resolve_video(archive_url):
-    identifier = get_archive_identifier(archive_url)
+def resolve_video(input_url):
+    """
+    Unified resolver: Returns (identifier, filename, download_url)
+    Works with Discord CDN URLs, raw video files, and Internet Archive URLs.
+    """
+    input_url = input_url.strip()
+    
+    if is_direct_video_url(input_url):
+        # Generate a deterministic cache key from the URL path (ignoring volatile Discord tokens)
+        parsed = urlparse(input_url)
+        clean_path = parsed.path
+        identifier = "discord_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
+        
+        # Extract filename from path or fallback to default
+        filename = os.path.basename(unquote(clean_path)) or "video.mp4"
+        download_url = input_url
+        return identifier, filename, download_url
+
+    # Standard Internet Archive path
+    identifier = get_archive_identifier(input_url)
     metadata = get_archive_metadata(identifier)
     video = find_video_file(metadata)
     filename = video["name"]
@@ -127,7 +163,7 @@ def get_cached_video_path(identifier, filename, download_url):
 
         log("Downloading (first time only):", download_url)
         tmp_path = dest_path + ".part"
-        with requests.get(download_url, headers=ARCHIVE_HEADERS, timeout=REQUEST_TIMEOUT, stream=True) as r:
+        with requests.get(download_url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT, stream=True) as r:
             r.raise_for_status()
             with open(tmp_path, "wb") as out:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
