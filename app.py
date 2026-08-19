@@ -46,11 +46,11 @@ def log(*args):
 
 
 # ============================================================
-# UNIFIED VIDEO RESOLUTION (DISCORD + INTERNET ARCHIVE + DIRECT)
+# UNIFIED MEDIA RESOLUTION (DISCORD + INTERNET ARCHIVE + DIRECT)
 # ============================================================
 
-def is_direct_video_url(url):
-    """Checks if the URL is a direct video attachment (e.g. Discord, raw MP4/WebM/MOV)."""
+def is_direct_media_url(url):
+    """Checks if the URL is a direct media attachment (e.g. Discord, raw MP4, PNG, JPG)."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     path = parsed.path.lower()
@@ -59,8 +59,8 @@ def is_direct_video_url(url):
     if "discordapp.com" in domain or "discordapp.net" in domain or "discord.com" in domain:
         return True
         
-    # Check for raw video extensions
-    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi")):
+    # Check for raw video and image extensions
+    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi", ".png", ".jpg", ".jpeg", ".gif", ".webp")):
         return True
         
     return False
@@ -69,7 +69,7 @@ def is_direct_video_url(url):
 def get_archive_identifier(url):
     parsed = urlparse(url)
     if parsed.netloc.lower() not in ("archive.org", "www.archive.org"):
-        raise ValueError("Only Internet Archive and direct video URLs (e.g. Discord) are supported.")
+        raise ValueError("Only Internet Archive and direct media URLs (e.g. Discord) are supported.")
     parts = [p for p in parsed.path.split("/") if p]
     if len(parts) < 2 or parts[0] not in ("details", "download"):
         raise ValueError("URL must be an Internet Archive /details/ URL.")
@@ -92,7 +92,7 @@ def find_video_file(metadata):
     others = [f for f in files if f.get("name", "").lower().endswith((".webm", ".mkv", ".mov", ".avi"))]
     candidates = mp4s or others
     if not candidates:
-        raise ValueError("No supported video file was found.")
+        raise ValueError("No supported media file was found.")
 
     ia_derivatives = [f for f in candidates if f.get("name", "").lower().endswith(".ia.mp4")]
     if ia_derivatives:
@@ -110,22 +110,20 @@ def build_archive_download_url(identifier, filename):
 def resolve_video(input_url):
     """
     Unified resolver: Returns (identifier, filename, download_url)
-    Works with Discord CDN URLs, raw video files, and Internet Archive URLs.
+    Works with Discord CDN URLs, raw media files, and Internet Archive URLs.
     """
     input_url = input_url.strip()
     
-    if is_direct_video_url(input_url):
-        # Generate a deterministic cache key from the URL path (ignoring volatile Discord tokens)
+    if is_direct_media_url(input_url):
+        # Generate a deterministic cache key from the URL path
         parsed = urlparse(input_url)
         clean_path = parsed.path
         identifier = "discord_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
         
-        # Extract filename from path or fallback to default
-        filename = os.path.basename(unquote(clean_path)) or "video.mp4"
+        filename = os.path.basename(unquote(clean_path)) or "media.mp4"
         download_url = input_url
         return identifier, filename, download_url
 
-    # Standard Internet Archive path
     identifier = get_archive_identifier(input_url)
     metadata = get_archive_metadata(identifier)
     video = find_video_file(metadata)
@@ -135,7 +133,7 @@ def resolve_video(input_url):
 
 
 # ============================================================
-# SOURCE VIDEO CACHE
+# SOURCE MEDIA CACHE
 # ============================================================
 
 _download_locks = {}
@@ -183,17 +181,29 @@ def get_video_info(path):
     ]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-    data = json.loads(result.stdout)
+        # Fallback for still image metadata if stream selection fails
+        command_img = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "stream=width,height",
+            "-of", "json", path
+        ]
+        result_img = subprocess.run(command_img, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result_img.returncode != 0:
+            raise RuntimeError(result.stderr)
+        data = json.loads(result_img.stdout)
+    else:
+        data = json.loads(result.stdout)
+
     streams = data.get("streams", [])
     if not streams:
-        raise ValueError("No video stream found.")
+        raise ValueError("No video or image stream found.")
     stream = streams[0]
     duration = stream.get("duration")
     try:
         duration = float(duration)
     except Exception:
-        duration = None
+        duration = 0.0  # Default to 0 duration for static images
+
     return {
         "width": int(stream.get("width", 0)),
         "height": int(stream.get("height", 0)),
@@ -224,10 +234,6 @@ def extract_full_audio_track(video_path, wav_path):
 
 
 def get_audio_features_for_frame(audio_data, frame_index, samples_per_frame):
-    """
-    Runs Fast Fourier Transform (FFT) on the frame's audio slice
-    to return top N dominant frequencies and volumes.
-    """
     start = frame_index * samples_per_frame
     end = start + samples_per_frame
     chunk = audio_data[start:end]
@@ -235,25 +241,22 @@ def get_audio_features_for_frame(audio_data, frame_index, samples_per_frame):
     audio_bytes = bytearray()
     
     if len(chunk) == samples_per_frame:
-        # Window function to minimize spectral leakage
         windowed = chunk * np.hanning(len(chunk))
         fft_data = np.abs(np.fft.rfft(windowed))
         freqs = np.fft.rfftfreq(len(chunk), 1.0 / AUDIO_SAMPLE_RATE)
 
-        # Get top N highest energy frequencies
         peak_indices = np.argsort(fft_data)[-NUM_AUDIO_CHANNELS:][::-1]
         max_possible_mag = (samples_per_frame * 32768) / 2
 
         for idx in peak_indices:
             freq = int(freqs[idx])
             magnitude = fft_data[idx] / max_possible_mag
-            volume = min(1.0, float(magnitude * 3.5))  # Moderate gain boost
+            volume = min(1.0, float(magnitude * 3.5))
             vol_byte = int(volume * 255)
 
-            # Pack 2 bytes frequency (big endian short), 1 byte volume (unsigned char)
             audio_bytes.extend(struct.pack(">HB", freq, vol_byte))
     else:
-        # Silence padding if audio stream ends before video stream
+        # Silent audio payload for missing frames / static images
         audio_bytes.extend(b"\x00" * (NUM_AUDIO_CHANNELS * 3))
 
     return bytes(audio_bytes)
@@ -284,7 +287,7 @@ class ExtractionJob:
 
     def run(self):
         try:
-            # 1. Extract and process audio track via WAV
+            # 1. Attempt audio extraction (silently ignored for static images)
             wav_path = os.path.join(self.frames_dir, "audio.wav")
             audio_data = np.array([], dtype=np.int16)
             samples_per_frame = int(AUDIO_SAMPLE_RATE / TARGET_FPS)
@@ -292,10 +295,11 @@ class ExtractionJob:
             try:
                 extract_full_audio_track(self.video_path, wav_path)
                 _, audio_data = wav.read(wav_path)
-            except Exception as audio_err:
-                log("Audio extraction failed/silent for", self.identifier, repr(audio_err))
+            except Exception:
+                # Soundless media/image files skip audio processing
+                pass
 
-            # 2. Extract video stream using FFmpeg pipe
+            # 2. Extract frame(s) using FFmpeg pipe
             vf = (
                 f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
                 f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=rgba"
@@ -312,8 +316,6 @@ class ExtractionJob:
 
             previous = np.zeros(FRAME_SIZE, dtype=np.uint8)
             index = 0
-            rate_check_start = time.time()
-            rate_check_index = 0
 
             while True:
                 raw = process.stdout.read(FRAME_SIZE)
@@ -324,14 +326,10 @@ class ExtractionJob:
                 current = np.frombuffer(raw, dtype=np.uint8)
 
                 if not os.path.exists(out_path):
-                    # Compute delta image bytes
                     delta = np.bitwise_xor(current, previous).tobytes()
                     encoded_video = encode_frame_payload(delta)
-
-                    # Compute audio sine bytes for this frame (12 bytes)
                     audio_payload = get_audio_features_for_frame(audio_data, index, samples_per_frame)
 
-                    # Structure frame on disk: [2-byte audio len][12-byte audio payload][compressed video payload]
                     header = struct.pack("<H", len(audio_payload))
                     full_payload = header + audio_payload + encoded_video
 
@@ -345,17 +343,9 @@ class ExtractionJob:
                 with self.lock:
                     self.ready = index
 
-                if index - rate_check_index >= 24:
-                    elapsed = time.time() - rate_check_start
-                    actual_fps = (index - rate_check_index) / elapsed if elapsed > 0 else 0
-                    log(f"Extraction: {actual_fps:.1f} fps - frame {index}")
-                    rate_check_start = time.time()
-                    rate_check_index = index
-
             process.stdout.close()
             process.wait(timeout=5)
 
-            # Cleanup temporary wav file
             if os.path.exists(wav_path):
                 os.remove(wav_path)
 
@@ -375,7 +365,8 @@ def get_or_start_job(identifier, video_path, duration_hint):
         job = _jobs.get(identifier)
         if job is None:
             job = ExtractionJob(identifier, video_path)
-            job.total_estimate = int((duration_hint or 0) * TARGET_FPS)
+            # Estimate at least 1 frame for static pictures
+            job.total_estimate = max(1, int((duration_hint or 0) * TARGET_FPS))
             _jobs[identifier] = job
             thread = threading.Thread(target=job.run, daemon=True)
             thread.start()
@@ -390,7 +381,7 @@ def get_or_start_job(identifier, video_path, duration_hint):
 def index():
     return jsonify({
         "status": "ok",
-        "service": "Roblox Video & Audio Server",
+        "service": "Roblox Video & Image Server",
         "resolution": f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         "fps": TARGET_FPS,
         "audioChannels": NUM_AUDIO_CHANNELS,
