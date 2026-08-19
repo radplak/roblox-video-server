@@ -48,7 +48,9 @@ def log(*args):
 
 
 def is_image_path(path):
-    return path.lower().endswith(IMAGE_EXTENSIONS)
+    # Strip URL parameters (?ex=... or &format=...) before checking extension
+    clean_path = urlparse(path).path.lower()
+    return clean_path.endswith(IMAGE_EXTENSIONS)
 
 
 # ============================================================
@@ -58,12 +60,12 @@ def is_image_path(path):
 def is_direct_media_url(url):
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-    path = parsed.path.lower()
+    clean_path = parsed.path.lower()
     
     if "discordapp.com" in domain or "discordapp.net" in domain or "discord.com" in domain:
         return True
         
-    if path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif") + IMAGE_EXTENSIONS):
+    if clean_path.endswith((".mp4", ".webm", ".mkv", ".mov", ".avi", ".gif") + IMAGE_EXTENSIONS):
         return True
         
     return False
@@ -111,6 +113,7 @@ def resolve_video(input_url):
         clean_path = parsed.path
         identifier = "direct_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
         
+        # Unquote and extract filename strictly from the URL path, ignoring query string
         filename = os.path.basename(unquote(clean_path)) or "media.mp4"
         download_url = input_url
         return identifier, filename, download_url
@@ -164,8 +167,9 @@ def get_cached_video_path(identifier, filename, download_url):
     return dest_path
 
 
-def get_video_info(path):
-    is_img = is_image_path(path)
+def get_video_info(path, original_filename=""):
+    # Check both disk path and original filename/URL for extension matching
+    is_img = is_image_path(path) or is_image_path(original_filename)
     if is_img:
         command = [
             "ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -290,7 +294,7 @@ class ExtractionJob:
 
             vf = (
                 f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=rgba"
+                f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-ih)/2:(oh-ih)/2,format=rgba"
             )
             
             command = [
@@ -376,7 +380,7 @@ def video_info():
     try:
         identifier, filename, download_url = resolve_video(archive_url)
         video_path = get_cached_video_path(identifier, filename, download_url)
-        source = get_video_info(video_path)
+        source = get_video_info(video_path, filename)
         is_image = (source["mediaType"] == "image")
         
         job = get_or_start_job(identifier, video_path, source["duration"], is_image)
@@ -416,7 +420,7 @@ def frames():
     try:
         identifier, filename, download_url = resolve_video(archive_url)
         video_path = get_cached_video_path(identifier, filename, download_url)
-        source = get_video_info(video_path)
+        source = get_video_info(video_path, filename)
         is_image = (source["mediaType"] == "image")
         
         job = get_or_start_job(identifier, video_path, source["duration"], is_image)
