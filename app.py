@@ -16,14 +16,16 @@ from flask import Flask, request, jsonify, Response
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG (OPTIMIZED FOR STABLE STREAMING WITH AUDIO)
+# CONFIG
 # ============================================================
 
-OUTPUT_WIDTH = 320
-OUTPUT_HEIGHT = 180
-TARGET_FPS = 24
-FRAME_SIZE = OUTPUT_WIDTH * OUTPUT_HEIGHT * 4  # RGBA
+VIDEO_WIDTH = 320
+VIDEO_HEIGHT = 180
 
+IMAGE_WIDTH = 1024
+IMAGE_HEIGHT = 576
+
+TARGET_FPS = 24
 NUM_AUDIO_CHANNELS = 4
 AUDIO_SAMPLE_RATE = 22050
 
@@ -48,7 +50,6 @@ def log(*args):
 
 
 def is_image_path(path):
-    # Strip URL parameters (?ex=... or &format=...) before checking extension
     clean_path = urlparse(path).path.lower()
     return clean_path.endswith(IMAGE_EXTENSIONS)
 
@@ -112,8 +113,6 @@ def resolve_video(input_url):
         parsed = urlparse(input_url)
         clean_path = parsed.path
         identifier = "direct_" + hashlib.md5(clean_path.encode("utf-8")).hexdigest()[:12]
-        
-        # Unquote and extract filename strictly from the URL path, ignoring query string
         filename = os.path.basename(unquote(clean_path)) or "media.mp4"
         download_url = input_url
         return identifier, filename, download_url
@@ -168,7 +167,6 @@ def get_cached_video_path(identifier, filename, download_url):
 
 
 def get_video_info(path, original_filename=""):
-    # Check both disk path and original filename/URL for extension matching
     is_img = is_image_path(path) or is_image_path(original_filename)
     if is_img:
         command = [
@@ -266,6 +264,10 @@ class ExtractionJob:
         self.identifier = identifier
         self.video_path = video_path
         self.is_image = is_image
+        self.width = IMAGE_WIDTH if is_image else VIDEO_WIDTH
+        self.height = IMAGE_HEIGHT if is_image else VIDEO_HEIGHT
+        self.frame_size = self.width * self.height * 4
+
         self.frames_dir = os.path.join(FRAME_DIR, identifier.replace("/", "_"))
         os.makedirs(self.frames_dir, exist_ok=True)
         self.ready = 0
@@ -293,8 +295,8 @@ class ExtractionJob:
                     pass
 
             vf = (
-                f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:(ow-ih)/2:(oh-ih)/2,format=rgba"
+                f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.width}:{self.height}:(ow-ih)/2:(oh-ih)/2,format=rgba"
             )
             
             command = [
@@ -309,12 +311,12 @@ class ExtractionJob:
             command.extend(["-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1"])
 
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            previous = np.zeros(FRAME_SIZE, dtype=np.uint8)
+            previous = np.zeros(self.frame_size, dtype=np.uint8)
             index = 0
 
             while True:
-                raw = process.stdout.read(FRAME_SIZE)
-                if len(raw) != FRAME_SIZE:
+                raw = process.stdout.read(self.frame_size)
+                if len(raw) != self.frame_size:
                     break
 
                 out_path = self.frame_path(index)
@@ -339,14 +341,14 @@ class ExtractionJob:
                     self.ready = index
 
                 if self.is_image:
-                    break  # Images only need 1 frame
+                    break
 
             process.stdout.close()
             process.wait(timeout=5)
 
             with self.lock:
                 self.done = True
-            log("Processed:", self.identifier, f"({index} frames, image={self.is_image})")
+            log("Processed:", self.identifier, f"({index} frames, image={self.is_image}, res={self.width}x{self.height})")
 
         except Exception as e:
             log("Extraction failed:", self.identifier, repr(e))
@@ -387,13 +389,13 @@ def video_info():
 
         return jsonify({
             "success": True,
-            "mediaType": source["mediaType"], # "image" or "video"
+            "mediaType": source["mediaType"],
             "identifier": identifier,
             "filename": filename,
             "sourceWidth": source["width"],
             "sourceHeight": source["height"],
-            "width": OUTPUT_WIDTH,
-            "height": OUTPUT_HEIGHT,
+            "width": job.width,
+            "height": job.height,
             "fps": 0 if is_image else TARGET_FPS,
             "audioChannels": 0 if is_image else NUM_AUDIO_CHANNELS,
             "codec": "delta+zstd+sine_audio",
@@ -455,8 +457,8 @@ def frames():
         headers = {
             "X-Start-Frame": str(start_frame),
             "X-Frame-Count": str(sent),
-            "X-Width": str(OUTPUT_WIDTH),
-            "X-Height": str(OUTPUT_HEIGHT),
+            "X-Width": str(job.width),
+            "X-Height": str(job.height),
             "X-Audio-Channels": "0" if is_image else str(NUM_AUDIO_CHANNELS),
             "X-Complete": "1" if (done or is_image) else "0",
             "X-Frames-Ready": str(ready),
